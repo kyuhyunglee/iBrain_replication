@@ -1,0 +1,21 @@
+# Paper settings (SPEC 1.4, 1.6). Change only paths and resources to match the environment.
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128}
+pretrain:
+  steps: null          # if null, epochs × (number of spike loader batches) (U20)
+  epochs: 30
+  warmup: 2000
+  batch_size: 32       # per type per GPU (SPEC 1.6). Multi-GPU is M7
+  ckpt_every: 1000
+  num_workers: 4
+data:
+  corpus_root: /scratch/connectome/nhp-spike-corpus/data/verified   # nhp-spike-corpus shard root (M2)
+  spike_sources: [dandi:000628]   # pretrain_candidate. Evaluation dandisets are not included (U14, M3)
+  ieeg: null           # M5: after AJILE12/SWEC loader access
+finetune:
+  head: attn           # attn | mean | flatten (U8)
+  epochs: 50
+  lr: 1.0e-4
+  wd: 5.0e-2
+  batch_size: 32
+  split_seed: 0        # fixed trial 80/20 split (M4). Independent of the run seed
+  seeds: [0, 1, 2]     # U12

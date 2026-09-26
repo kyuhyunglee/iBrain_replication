@@ -1,0 +1,20 @@
+# For local verification (CPU/MPS, synthetic data). Only checks that the pipeline runs; the numbers are not meaningful.
+model: {d: 64, H: 4, ffn: 128, L: 2, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 32}
+pretrain:
+  steps: 60
+  epochs: null
+  warmup: 10
+  batch_size: 8
+  ckpt_every: 20
+  num_workers: 0
+data:
+  synthetic: true      # creates write_synthetic shards in out_dir/data and uses them
+  ieeg: synthetic      # puts SyntheticIEEG into the 1:1 alternation (M6 synthetic)
+finetune:
+  head: attn
+  epochs: 5
+  lr: 1.0e-3
+  wd: 5.0e-2
+  batch_size: 16
+  split_seed: 0
+  seeds: [0, 1]

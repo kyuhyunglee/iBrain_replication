@@ -427,3 +427,12 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# project (ibrain-repro)
+.venv/
+__pycache__/
+.pytest_cache/
+.DS_Store
+runs/
+logs/
+*.pt
