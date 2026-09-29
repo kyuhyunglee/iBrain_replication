@@ -7,10 +7,18 @@ pretrain:
   batch_size: 32       # per type per GPU (SPEC 1.6). Multi-GPU is M7
   ckpt_every: 1000
   num_workers: 4
+  shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
 data:
-  corpus_root: /scratch/connectome/nhp-spike-corpus/data/verified   # nhp-spike-corpus shard root (M2)
-  spike_sources: [dandi:000628]   # pretrain_candidate. Evaluation dandisets are not included (U14, M3)
-  ieeg: null           # M5: after AJILE12/SWEC loader access
+  # Prefix confirmed on the server 2026-09-29 (iBrain_pretrain/). Folders below it are from the 09-28 survey.
+  spike:
+    format: pile         # pile = Neural Pile primate parquet (U10, U30) | corpus = nhp-spike-corpus shards | synthetic
+    root: /storage/connectome/zres0710/iBrain_pretrain/spikes/neural-pile-primate
+    split: train
+    exclude_sources: [perich, area2-bump, dmfc-rsg]   # sources holding downstream evaluation sessions (U14)
+    max_rows: null       # seeded random subset of rows for small runs. null = all rows, held in memory as uint8 (tens of GB)
+  ieeg:                  # AJILE12 + SWEC, streamed by block (U31, U32). Skipped with --spike-only (M3)
+    - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: null}
+    - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: null}
 finetune:
   head: attn           # attn | mean | flatten (U8)
   epochs: 50

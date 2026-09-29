@@ -117,3 +117,28 @@ def test_total_steps_counts_spike_epochs():
     steps = total_steps(30, 7, 2)
     assert steps == 420
     assert sum(t % 2 == 0 for t in range(steps)) == 30 * 7  # loaders[t % 2], spike is index 0
+
+
+def test_script_joint_step_count(tmp_path):
+    """U20 at script level: with --spike-only the spike loader is seen `epochs` times; joint runs double the steps so
+    spike is still seen exactly `epochs` times (the halving bug was in scripts/pretrain.py, not in total_steps)."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+    import yaml
+    root = Path(__file__).resolve().parent.parent
+    cfg = yaml.safe_load((root / "configs/tiny.yaml").read_text())
+    cfg["model"].update(d=16, H=2, ffn=32, L=1, d_proj=8)
+    cfg["pretrain"].update(steps=None, epochs=2, warmup=1, ckpt_every=1000)
+    (tmp_path / "c.yaml").write_text(yaml.safe_dump(cfg))
+    for extra, n_loaders in ((["--spike-only"], 1), ([], 2)):
+        out = tmp_path / f"run{n_loaders}"
+        r = subprocess.run([sys.executable, str(root / "scripts/pretrain.py"), "--config", str(tmp_path / "c.yaml"),
+                            "--out", str(out), "--device", "cpu", *extra], capture_output=True, text=True, cwd=root)
+        assert r.returncode == 0, r.stderr[-1500:]
+        meta = json.loads((out / "meta.json").read_text())
+        log = [json.loads(l) for l in (out / "log.jsonl").read_text().splitlines()]
+        spike_batches = meta["data"]["spike_windows"] // cfg["pretrain"]["batch_size"]
+        assert meta["data"]["steps"] == len(log) == 2 * spike_batches * n_loaders
+        assert sum(h["sig"] == SPIKE for h in log) == 2 * spike_batches  # spike sees exactly 2 epochs either way
