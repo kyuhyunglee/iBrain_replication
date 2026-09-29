@@ -1,12 +1,13 @@
 """M5 verification (synthetic): iEEG patches, encoder shape, channel normalization, MSE loss. M6 verification: gradient isolation between types under 1:1 alternation, both losses decrease."""
 import copy
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from ibrain.data_ieeg import SyntheticIEEG, to_patches
+from ibrain.data_ieeg import SyntheticIEEG, channel_normalize, channel_stats, to_patches
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
-from ibrain.model import IBrain, IEEG, SPIKE, channel_normalize, masked_mse
+from ibrain.model import IBrain, IEEG, SPIKE, masked_mse
 from ibrain.pretrain import pretrain, sample_mask, step_losses
 
 
@@ -17,30 +18,37 @@ def ieeg_batch(n=3, channels=(4, 16, 64)):
 
 def test_patches_and_encoder_shape():
     ds = SyntheticIEEG((4, 16), n_windows=2)
-    x = ds[0]
+    x = to_patches(ds.windows[0])
     assert x.shape == (4, 10, 50) and x.dtype == torch.float32  # (C, S, P_iEEG), SPEC 1.1
     assert torch.equal(x.reshape(4, 500), torch.as_tensor(ds.windows[0], dtype=torch.float32))  # x[c, s, p] = wave[c, 50s + p]
+    assert ds[0].shape == (4, 10, 50) and ds[0].dtype == torch.float32
     x, valid = ieeg_batch()
     assert x.shape == (3, 64, 10, 50) and valid.sum(1).tolist() == [4, 16, 64]
     m = IBrain(d=64, H=4, ffn=128, L=2, d_proj=32)
-    u = m.encode(channel_normalize(x), valid, IEEG)
+    u = m.encode(x, valid, IEEG)
     assert u.shape == (3, 64, 10, 64)  # Eq. 5
     assert m.reconstruct(u, IEEG).shape == (3, 64, 10, 50)  # Eq. 7
 
 
 def test_channel_normalize():
+    """U4: statistics come from the whole recording, not from the window, so a window's values
+    do not depend on which of its patches are masked and the window mean is not forced to 0."""
+    ds = SyntheticIEEG((4, 16), n_windows=8)
+    for i in range(2):
+        rec = np.concatenate([w for w, j in zip(ds.windows, ds.session) if j == i], axis=1)
+        z = np.concatenate([ds[k].reshape(len(rec), -1).numpy() for k in range(len(ds)) if ds.session[k] == i], axis=1)
+        q25, q50, q75 = np.percentile(z, [25, 50, 75], axis=1)
+        assert np.allclose(q50, 0, atol=1e-4) and np.allclose((q75 - q25) / 1.349, 1, atol=1e-3)  # per channel, per recording
+        c, sc = channel_stats(rec)
+        assert np.allclose(z, channel_normalize(rec, c, sc), atol=1e-4)  # same stats for every window of the recording
+    assert not np.allclose(ds[0].numpy().mean((1, 2)), 0, atol=1e-2)  # not a per-window z-score
     x, valid = ieeg_batch()
-    z = channel_normalize(x)
-    m, s = z.mean((2, 3)), z.std((2, 3))
-    assert torch.allclose(m[valid], torch.zeros_like(m[valid]), atol=1e-4)  # per-channel z-score, within the window (U4)
-    assert torch.allclose(s[valid], torch.ones_like(s[valid]), atol=1e-3)
-    assert not z[~valid].any()  # padding channels stay 0
+    assert not x[~valid].any()  # padding channels stay 0
 
 
 def test_masked_mse_ignores_padding_and_unmasked():
     torch.manual_seed(0)
     x, valid = ieeg_batch()
-    x = channel_normalize(x)
     mask = sample_mask(valid, 10)
     xhat = torch.randn_like(x)
     x2, xhat2 = x.clone(), xhat.clone()
@@ -66,7 +74,7 @@ def test_ieeg_step_losses_decrease():
         opt.step()
         first = first or rec.item()
     print(f"\niEEG rec {first:.4f} -> {rec.item():.4f}")
-    assert rec.item() < first < 1.5  # normalized targets have variance 1, so predicting 0 gives about 1
+    assert rec.item() < first < 1.5  # targets have robust std 1, so predicting 0 gives about 1 or less
 
 
 def test_type_isolation():
