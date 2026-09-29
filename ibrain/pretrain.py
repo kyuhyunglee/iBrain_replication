@@ -41,6 +41,13 @@ def lr_at(step, steps, warmup):
     return LR_MIN + 0.5 * (LR - LR_MIN) * (1 + math.cos(math.pi * t))
 
 
+def total_steps(epochs, n_spike_batches, n_loaders):
+    """Training length in steps (U20). One epoch = one pass over the spike loader. Under 1:1 alternation spike
+    gets every n_loaders-th step, so the total is multiplied by n_loaders; the iEEG loader cycles as needed
+    (about 0.81 passes per epoch at paper scale). Same as zip(ieeg, spike) over 30 epochs."""
+    return epochs * n_spike_batches * n_loaders
+
+
 def step_losses(model, x, valid, sig):
     """(L_rec, L_align) for one step (Eq. 13). sig = SPIKE: Eq. 10, 11. sig = IEEG: Eq. 8, 9.
     iEEG x is already channel-normalized by the Dataset (U4), so input and target are the same values."""

@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader
 from ibrain.data_ieeg import SyntheticIEEG
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.model import IBrain, IEEG, SPIKE
-from ibrain.pretrain import pretrain
+from ibrain.pretrain import pretrain, total_steps
 from ibrain.repro import run_meta, seed_all, write_json
 
 
@@ -49,7 +49,7 @@ def main():
                                          collate_fn=collate, generator=g)))
     elif dc.get("ieeg"):
         raise NotImplementedError("iEEG real-data loader is M5 (after AJILE12/SWEC access)")
-    steps = pc["steps"] or pc["epochs"] * len(dl_spike)  # U20
+    steps = pc["steps"] or total_steps(pc["epochs"], len(dl_spike), len(loaders))  # U20
     print(f"steps={steps} spike batches/epoch={len(dl_spike)} loaders={len(loaders)} device={a.device}")
 
     model = IBrain(**cfg["model"])

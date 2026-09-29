@@ -110,7 +110,7 @@ If storage forces float16, store the normalized signal instead and set center = 
 | `ibrain/preprocess_ieeg.py` (new) | Steps 3.2–3.7 as pure functions on `(C, T)` arrays, testable on `SyntheticIEEG`-like signals |
 | `scripts/preprocess_ieeg.py` (new) | CLI: one recording in, one shard directory out; resumable; run as a Slurm array job over recordings |
 | `ibrain/data_ieeg.py` | Add `read_windows(root, dataset)` and `IEEGWindows(Dataset)`; `__getitem__` = `to_patches(channel_normalize(signal, center, scale))` |
-| `scripts/pretrain.py` | Replace the `NotImplementedError` branch with `IEEGWindows`; fix the step count under 1:1 alternation (currently `epochs × len(dl_spike)`, which gives each type only half the epochs) |
+| `scripts/pretrain.py` | Replace the `NotImplementedError` branch with `IEEGWindows`; the step count under 1:1 alternation is already handled by `pretrain.total_steps` (U20) |
 | `configs/paper.yaml` | `data.ieeg: {root: ..., datasets: [ajile12, swec]}` |
 | `SPEC.md` Section 2 | New decision rows for 3.1–3.8 (chunk length, bad channel rule, reference, filters, clip, bad segments, seizures, dtype) |
 
