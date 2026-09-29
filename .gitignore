@@ -436,3 +436,9 @@ __pycache__/
 runs/
 logs/
 *.pt
+
+# Paper PDF
+*.pdf
+
+# Python egg metadata
+*.egg-info
