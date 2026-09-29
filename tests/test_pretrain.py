@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader
 
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.model import IBrain, SPIKE, masked_poisson_nll
-from ibrain.pretrain import LR, LR_MIN, lr_at, pretrain, sample_mask, sample_views
+from ibrain.pretrain import LR, LR_MIN, lr_at, pretrain, sample_mask, sample_views, total_steps
 
 
 def valid_of(ns, C):
@@ -109,3 +109,11 @@ def test_checkpoint_and_resume(tmp_path):
     assert len((out2 / "log.jsonl").read_text().splitlines()) == 10
     assert json.loads((out2 / "log.jsonl").read_text().splitlines()[-1])["step"] == 9
     assert load_checkpoint(out2 / "final.pt")["step"] == 9
+
+
+def test_total_steps_counts_spike_epochs():
+    """U20: epochs are counted on the spike loader. Under 1:1 alternation spike still gets exactly epochs × batches."""
+    assert total_steps(30, 7, 1) == 210  # spike-only: unchanged
+    steps = total_steps(30, 7, 2)
+    assert steps == 420
+    assert sum(t % 2 == 0 for t in range(steps)) == 30 * 7  # loaders[t % 2], spike is index 0
