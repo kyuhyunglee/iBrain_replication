@@ -146,11 +146,6 @@ class IBrain(nn.Module):
         return q, self.pred(q)
 
 
-def channel_normalize(x, eps=1e-6):
-    """iEEG: per-channel z-score within the 1 s window (U4). (B, C, S, P). Padded (all-zero) channels stay 0."""
-    return (x - x.mean((2, 3), keepdim=True)) / (x.std((2, 3), keepdim=True) + eps)
-
-
 def _masked_mean(per_patch, mask, valid):
     """Numerator/denominator of Eq. (9)(11): mean over masked valid patches. per_patch, mask (B, C, S), valid (B, C)."""
     w = (mask & valid[..., None]).to(per_patch.dtype)

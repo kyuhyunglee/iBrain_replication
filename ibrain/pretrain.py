@@ -6,7 +6,7 @@ from pathlib import Path
 
 import torch
 
-from ibrain.model import IEEG, SPIKE, channel_normalize, masked_mse, masked_poisson_nll, simsiam_loss
+from ibrain.model import SPIKE, masked_mse, masked_poisson_nll, simsiam_loss
 from ibrain.repro import load_checkpoint, save_checkpoint, set_rng_state
 
 LR, LR_MIN, WD, CLIP = 5e-4, 1e-5, 5e-2, 1.0  # SPEC 1.6
@@ -42,9 +42,8 @@ def lr_at(step, steps, warmup):
 
 
 def step_losses(model, x, valid, sig):
-    """(L_rec, L_align) for one step (Eq. 13). sig = SPIKE: Eq. 10, 11. sig = IEEG: Eq. 8, 9."""
-    if sig == IEEG:
-        x = channel_normalize(x)  # target is the channel-normalized patch; the input gets the same normalization (U4)
+    """(L_rec, L_align) for one step (Eq. 13). sig = SPIKE: Eq. 10, 11. sig = IEEG: Eq. 8, 9.
+    iEEG x is already channel-normalized by the Dataset (U4), so input and target are the same values."""
     mask = sample_mask(valid, x.shape[2])
     u = model.encode(x.masked_fill(mask[..., None], 0.0), valid, sig)  # Eq. 6: mask in raw signal space, then encode
     xhat = model.reconstruct(u, sig)
