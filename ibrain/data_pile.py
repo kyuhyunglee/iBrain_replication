@@ -11,8 +11,9 @@ from torch.utils.data import Dataset
 from ibrain.data_spike import BIN_SECONDS, WINDOW_BINS, to_patches
 
 # Pile sources that hold downstream evaluation sessions (lab-server survey, 2026-09-28, U14):
-# perich = all 111 sessions of DANDI 000688, area2-bump = both files of 000127, dmfc-rsg = 000130.
-LEAKED = ("perich", "area2-bump", "dmfc-rsg")
+# perich = all 111 sessions of DANDI 000688, area2-bump = both files of 000127. dmfc-rsg (000130) is kept: it is not an
+# iBrain downstream task (decided 2026-09-29).
+LEAKED = ("perich", "area2-bump")
 
 
 def pile_files(root, split="train"):
@@ -48,10 +49,10 @@ def row_matrices(column):
 
 class PileWindows(Dataset):
     """1 s windows (C, S, P) from the Neural Pile. Rows are held in memory as uint8, windows are indexed lazily.
-    exclude_sources: pile sources left out (U14). A name that is not a source of the split raises, so a typo
-    cannot silently keep leaked data. max_rows: a seeded random subset of the remaining rows (small-scale runs)."""
+    exclude_sources: pile sources left out (U14). The default is none, as in the paper; LEAKED gives the variant without
+    evaluation sessions. A name that is not a source of the split raises, so a typo cannot silently keep leaked data. max_rows: a seeded random subset of the remaining rows (small-scale runs)."""
 
-    def __init__(self, root, split="train", exclude_sources=LEAKED, max_rows=None, seed=0):
+    def __init__(self, root, split="train", exclude_sources=(), max_rows=None, seed=0):
         files = pile_files(root, split)
         meta = []
         for fi, f in enumerate(files):

@@ -34,7 +34,7 @@ Checkout `configs/tiny.yaml` for all configurations available.
 
 ### Pretraining on spikes
 To pretrain on real spikes you first need the [Neural Pile primate](https://huggingface.co/datasets/eminorhan/neural-pile-primate) parquet files, the corpus the paper used.
-Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. Sources that contain downstream evaluation sessions (Perich, Area2-Bump, DMFC-RSG) are excluded by `data.spike.exclude_sources`, and a misspelled source name stops the run.
+Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. As in the paper the whole pile is used, although it contains the Perich and Area2-Bump evaluation sessions; set `data.spike.exclude_sources: [perich, area2-bump]` for the variant without them. Each step averages 8 batches of 32 (`grad_accum`), the paper's 8 GPUs x 32.
 
 Then you can pretrain on spikes only by running:
 

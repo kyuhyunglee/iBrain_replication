@@ -43,10 +43,10 @@ def test_row_matrices_roundtrip():
 
 def test_windows_and_exclusion(tmp_path):
     truth = write_pile(tmp_path)
-    ds = PileWindows(tmp_path, "train")  # default excludes perich, area2-bump, dmfc-rsg (U14)
+    ds = PileWindows(tmp_path, "train", exclude_sources=LEAKED)  # variant without evaluation sessions (U14)
     assert ds.excluded == sorted(LEAKED) and not ds.leaked
-    # kept: xiao 365 bins -> 7 windows, churchland 35 -> 0, xiao 101 -> 2
-    assert len(ds) == 9 and len(ds.mats) == 3
+    # kept: xiao 365 bins -> 7 windows, churchland 35 -> 0, xiao 101 -> 2, dmfc-rsg 120 -> 2
+    assert len(ds) == 11 and len(ds.mats) == 4
     x = ds[7]  # first window of the xiao row in file 1
     m = truth[("xiao", "train-00001-of-00002-0")]
     assert x.shape == (12, 10, 5) and x.dtype == torch.float32
@@ -69,3 +69,11 @@ def test_max_rows_is_seeded(tmp_path):
     a = PileWindows(tmp_path, "train", exclude_sources=[], max_rows=3, seed=1)
     b = PileWindows(tmp_path, "train", exclude_sources=[], max_rows=3, seed=1)
     assert len(a.mats) == 3 and len(a) == len(b) and all(np.array_equal(x, y) for x, y in zip(a.mats, b.mats))
+
+
+def test_default_is_the_paper_pile(tmp_path, capsys):
+    """U14: by default nothing is excluded, as in the paper, and the leaked sources are reported."""
+    write_pile(tmp_path)
+    ds = PileWindows(tmp_path, "train")
+    assert ds.excluded == [] and ds.leaked == sorted(LEAKED) and len(ds) == 5 + 9 + 2 + 1
+    assert "WARNING" in capsys.readouterr().out

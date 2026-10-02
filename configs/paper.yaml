@@ -4,7 +4,8 @@ pretrain:
   steps: null          # if null, epochs × (spike loader batches) × (number of loaders) (U20)
   epochs: 30
   warmup: 2000
-  batch_size: 32       # per type per GPU (SPEC 1.6). Multi-GPU is M7
+  batch_size: 32       # per type per GPU (SPEC 1.6)
+  grad_accum: 8        # 32 x 8 = 256 per step = the paper's 8 GPUs x 32 (U33). 4 GPUs (lab max) would need 2
   ckpt_every: 1000
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
@@ -14,7 +15,7 @@ data:
     format: pile         # pile = Neural Pile primate parquet (U10, U30) | corpus = nhp-spike-corpus shards | synthetic
     root: /storage/connectome/zres0710/iBrain_pretrain/spikes/neural-pile-primate
     split: train
-    exclude_sources: [perich, area2-bump, dmfc-rsg]   # sources holding downstream evaluation sessions (U14)
+    exclude_sources: []   # as in the paper (U14). [perich, area2-bump] = variant without evaluation sessions
     max_rows: null       # seeded random subset of rows for small runs. null = all rows, held in memory as uint8 (tens of GB)
   ieeg:                  # AJILE12 + SWEC, streamed by block (U31, U32). Skipped with --spike-only (M3)
     - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: null}

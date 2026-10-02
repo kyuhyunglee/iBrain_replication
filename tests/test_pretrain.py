@@ -121,7 +121,8 @@ def test_total_steps_counts_spike_epochs():
 
 def test_script_joint_step_count(tmp_path):
     """U20 at script level: with --spike-only the spike loader is seen `epochs` times; joint runs double the steps so
-    spike is still seen exactly `epochs` times (the halving bug was in scripts/pretrain.py, not in total_steps)."""
+    spike is still seen exactly `epochs` times (the halving bug was in scripts/pretrain.py, not in total_steps).
+    U33: with gradient accumulation each optimizer step consumes `accum` loader batches, and the exposure is unchanged."""
     import json
     import subprocess
     import sys
@@ -130,15 +131,36 @@ def test_script_joint_step_count(tmp_path):
     root = Path(__file__).resolve().parent.parent
     cfg = yaml.safe_load((root / "configs/tiny.yaml").read_text())
     cfg["model"].update(d=16, H=2, ffn=32, L=1, d_proj=8)
-    cfg["pretrain"].update(steps=None, epochs=2, warmup=1, ckpt_every=1000)
-    (tmp_path / "c.yaml").write_text(yaml.safe_dump(cfg))
-    for extra, n_loaders in ((["--spike-only"], 1), ([], 2)):
-        out = tmp_path / f"run{n_loaders}"
-        r = subprocess.run([sys.executable, str(root / "scripts/pretrain.py"), "--config", str(tmp_path / "c.yaml"),
-                            "--out", str(out), "--device", "cpu", *extra], capture_output=True, text=True, cwd=root)
-        assert r.returncode == 0, r.stderr[-1500:]
-        meta = json.loads((out / "meta.json").read_text())
-        log = [json.loads(l) for l in (out / "log.jsonl").read_text().splitlines()]
-        spike_batches = meta["data"]["spike_windows"] // cfg["pretrain"]["batch_size"]
-        assert meta["data"]["steps"] == len(log) == 2 * spike_batches * n_loaders
-        assert sum(h["sig"] == SPIKE for h in log) == 2 * spike_batches  # spike sees exactly 2 epochs either way
+    for accum in (1, 2):
+        cfg["pretrain"].update(steps=None, epochs=2, warmup=1, ckpt_every=1000, grad_accum=accum)
+        (tmp_path / "c.yaml").write_text(yaml.safe_dump(cfg))
+        for extra, n_loaders in ((["--spike-only"], 1), ([], 2)):
+            out = tmp_path / f"run{n_loaders}_a{accum}"
+            r = subprocess.run([sys.executable, str(root / "scripts/pretrain.py"), "--config", str(tmp_path / "c.yaml"),
+                                "--out", str(out), "--device", "cpu", *extra], capture_output=True, text=True, cwd=root)
+            assert r.returncode == 0, r.stderr[-1500:]
+            meta = json.loads((out / "meta.json").read_text())
+            log = [json.loads(line) for line in (out / "log.jsonl").read_text().splitlines()]
+            spike_batches = meta["data"]["spike_windows"] // cfg["pretrain"]["batch_size"]
+            assert meta["data"]["steps"] == len(log) == 2 * (spike_batches // accum) * n_loaders
+            assert sum(h["sig"] == SPIKE for h in log) * accum == 2 * spike_batches  # spike sees exactly 2 epochs
+
+
+def test_accumulation_draws_accum_batches_per_step(tmp_path):
+    """U33: each optimizer step really draws `accum` batches of its type (counted at the dataset)."""
+    write_synthetic(tmp_path, (3, 8), n_windows=8)
+    ds = SpikeWindows(read_windows(tmp_path, SYNTHETIC))
+    drawn = []
+
+    class Counting(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(ds)
+
+        def __getitem__(self, i):
+            drawn.append(i)
+            return ds[i]
+
+    dl = DataLoader(Counting(), batch_size=4, shuffle=True, collate_fn=collate)
+    torch.manual_seed(0)
+    hist = pretrain(IBrain(d=16, H=2, ffn=32, L=1, d_proj=8), [(SPIKE, dl)], steps=5, warmup=1, accum=3)
+    assert len(hist) == 5 and len(drawn) == 5 * 3 * 4

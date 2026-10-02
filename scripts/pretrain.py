@@ -27,7 +27,7 @@ def spike_data(sc, out, seed):
     """data.spike -> (Dataset, hours)."""
     fmt = sc["format"]
     if fmt == "pile":
-        ds = PileWindows(sc["root"], sc.get("split", "train"), sc.get("exclude_sources", LEAKED), sc.get("max_rows"),
+        ds = PileWindows(sc["root"], sc.get("split", "train"), sc.get("exclude_sources", ()), sc.get("max_rows"),
                          seed)
         return ds, ds.hours
     if fmt == "corpus":
@@ -85,14 +85,16 @@ def main():
     if dc.get("ieeg") and not a.spike_only:
         ds_ieeg, ieeg_h = ieeg_data(dc["ieeg"], a.seed, pc.get("shuffle_buffer", 1024))
         loaders.append((IEEG, loader(ds_ieeg, pc["batch_size"], g, workers)))
-    steps = pc["steps"] or total_steps(pc["epochs"], len(dl_spike), len(loaders))  # U20: x2 under 1:1 alternation
-    meta["data"] = {"spike_windows": len(ds_spike), "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps}
+    accum = pc.get("grad_accum", 1)  # U33
+    steps = pc["steps"] or total_steps(pc["epochs"], len(dl_spike), len(loaders), accum)  # U20: x2 under 1:1 alternation
+    meta["data"] = {"spike_windows": len(ds_spike), "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps,
+                    "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum}
     write_json(out / "meta.json", meta)
-    print(f"steps={steps} spike batches/epoch={len(dl_spike)} loaders={len(loaders)} device={a.device}")
+    print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device}")
 
     model = IBrain(**cfg["model"])
     pretrain(model, loaders, steps, pc["warmup"], a.device, out_dir=out, ckpt_every=pc["ckpt_every"],
-             resume=a.resume, meta=meta)
+             resume=a.resume, meta=meta, accum=accum)
 
 
 if __name__ == "__main__":
