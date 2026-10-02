@@ -45,8 +45,9 @@ def total_steps(epochs, n_spike_batches, n_loaders, accum=1):
     """Training length in optimizer steps (U20). One epoch = one pass over the spike loader. Under 1:1 alternation spike
     gets every n_loaders-th step, so the total is multiplied by n_loaders; the iEEG loader cycles as needed
     (about 0.81 passes per epoch at paper scale). Same as zip(ieeg, spike) over 30 epochs.
-    With gradient accumulation (U33) one optimizer step consumes `accum` loader batches of one type."""
-    return epochs * max(1, n_spike_batches // accum) * n_loaders
+    With gradient accumulation (U33) one optimizer step consumes `accum` loader batches of one type. The spike step
+    count is rounded up over the whole run, so spike sees epochs x n_spike_batches batches plus fewer than accum extra."""
+    return -(-epochs * n_spike_batches // accum) * n_loaders
 
 
 def step_losses(model, x, valid, sig):

@@ -131,7 +131,7 @@ def test_script_joint_step_count(tmp_path):
     root = Path(__file__).resolve().parent.parent
     cfg = yaml.safe_load((root / "configs/tiny.yaml").read_text())
     cfg["model"].update(d=16, H=2, ffn=32, L=1, d_proj=8)
-    for accum in (1, 2):
+    for accum in (1, 2, 5):  # 5 does not divide the 6 spike batches: rounding must not lose or add a pass
         cfg["pretrain"].update(steps=None, epochs=2, warmup=1, ckpt_every=1000, grad_accum=accum)
         (tmp_path / "c.yaml").write_text(yaml.safe_dump(cfg))
         for extra, n_loaders in ((["--spike-only"], 1), ([], 2)):
@@ -141,9 +141,10 @@ def test_script_joint_step_count(tmp_path):
             assert r.returncode == 0, r.stderr[-1500:]
             meta = json.loads((out / "meta.json").read_text())
             log = [json.loads(line) for line in (out / "log.jsonl").read_text().splitlines()]
-            spike_batches = meta["data"]["spike_windows"] // cfg["pretrain"]["batch_size"]
-            assert meta["data"]["steps"] == len(log) == 2 * (spike_batches // accum) * n_loaders
-            assert sum(h["sig"] == SPIKE for h in log) * accum == 2 * spike_batches  # spike sees exactly 2 epochs
+            spike_batches = -(-meta["data"]["spike_windows"] // cfg["pretrain"]["batch_size"])  # DataLoader length
+            assert meta["data"]["steps"] == len(log) == -(-2 * spike_batches // accum) * n_loaders
+            drawn = sum(h["sig"] == SPIKE for h in log) * accum
+            assert 0 <= drawn - 2 * spike_batches < accum  # 2 epochs, plus less than one accumulation group
 
 
 def test_accumulation_draws_accum_batches_per_step(tmp_path):

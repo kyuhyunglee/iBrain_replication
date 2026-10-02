@@ -14,7 +14,7 @@ import yaml
 from torch.utils.data import DataLoader, IterableDataset
 
 from ibrain.data_ieeg import IEEGStream, SyntheticIEEG, ajile12_blocks, select_hours, swec_blocks
-from ibrain.data_pile import LEAKED, PileWindows
+from ibrain.data_pile import PileWindows
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.model import IBrain, IEEG, SPIKE
 from ibrain.pretrain import pretrain, total_steps
@@ -91,6 +91,9 @@ def main():
                     "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum}
     write_json(out / "meta.json", meta)
     print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device}")
+    if pc["warmup"] >= steps:
+        print(f"WARNING: warmup {pc['warmup']} >= {steps} steps: lr never reaches its peak and the cosine decay never runs. "
+              "Lower pretrain.warmup for small runs (U20, U33)")
 
     model = IBrain(**cfg["model"])
     pretrain(model, loaders, steps, pc["warmup"], a.device, out_dir=out, ckpt_every=pc["ckpt_every"],
