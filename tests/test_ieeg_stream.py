@@ -166,3 +166,15 @@ def test_short_tail_joins_previous_block(tmp_path):
     assert spans == [(0, 9), (9, 20)]  # the 2 s tail is too short for its own statistics
     spans = [(b.start // 500, b.stop // 500) for b in ajile12_blocks(tmp_path, block_seconds=8)]
     assert spans == [(0, 8), (8, 16), (16, 20)]  # a 4 s tail (half a block) keeps its own block
+
+
+def test_swec_blocks_follow_storage_chunks(tmp_path):
+    """Blocks are a whole number of storage chunks (read per file), so they start on chunk boundaries."""
+    fs, C = 1024, 2
+    x = np.random.default_rng(0).normal(size=(C, fs * 40)).astype(np.float32)
+    with h5py.File(tmp_path / "ID01_1h.h5", "w") as h:
+        h.create_dataset("data/ieeg", data=x, chunks=(C, 4 * fs), **hdf5plugin.Blosc())  # 4 s chunks
+        h.attrs["sampling_rate"] = fs
+    blocks = swec_blocks(tmp_path, target_seconds=9)  # closest whole number of chunks: 2 x 4 s = 8 s
+    assert [(b.start // fs, b.stop // fs) for b in blocks] == [(0, 8), (8, 16), (16, 24), (24, 32), (32, 40)]
+    assert all(b.start % (4 * fs) == 0 for b in blocks)

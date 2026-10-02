@@ -204,8 +204,13 @@ def ajile12_blocks(root, block_seconds=675):
     return out
 
 
-def swec_blocks(root, block_seconds=256.0):
+def swec_blocks(root, block_seconds=None, target_seconds=900):
     """SWEC-ETHZ part files -> blocks (U32). data/ieeg is (C, T) with sampling_rate in the root attributes.
+    The signal is compressed in chunks (3 min in the dataset card), and reading any sample decompresses its whole chunk.
+    By default a block is the whole number of chunks closest to target_seconds, read from each file's own chunk size,
+    so blocks start on chunk boundaries; the 1 s resampling context then touches only the two neighbouring chunks
+    (900 s = 5 chunks: 7 chunks decompressed per 5 used, instead of about 2.4 per 256 s block before). block_seconds
+    overrides this (tests).
     IDxx_total.h5 files are virtual datasets over the parts and are skipped, because a virtual dataset over parts that
     are still downloading reads as zeros. There is no channel metadata, so every channel is kept; seizures are kept.
     Files that cannot be opened (incomplete download) are skipped with a message."""
@@ -218,11 +223,19 @@ def swec_blocks(root, block_seconds=256.0):
     for f in files:
         try:
             with h5py.File(f, "r") as h:
-                n, fs = h["data/ieeg"].shape[1], float(h.attrs["sampling_rate"])
+                d = h["data/ieeg"]
+                n, fs, chunk = d.shape[1], float(h.attrs["sampling_rate"]), (d.chunks or (None, None))[1]
         except (OSError, KeyError) as e:
             skipped.append(f"{f.name} ({type(e).__name__})")
             continue
-        out += _blocks(f, "data/ieeg", n, fs, 1, block_seconds)
+        seconds = block_seconds
+        if seconds is None:
+            chunk_s = chunk / fs if chunk else None
+            if chunk_s and abs(chunk_s - round(chunk_s)) < 1e-9:  # whole seconds, so whole 1 s windows per block
+                seconds = chunk_s * max(1, round(target_seconds / chunk_s))
+            else:
+                seconds = target_seconds
+        out += _blocks(f, "data/ieeg", n, fs, 1, seconds)
     if skipped:
         print(f"SWEC: skipped {len(skipped)} unreadable files: {skipped[:5]}")
     return out
