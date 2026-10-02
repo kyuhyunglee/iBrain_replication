@@ -8,8 +8,8 @@ pretrain:
   ckpt_every: 20
   num_workers: 0
 data:
-  synthetic: true      # creates write_synthetic shards in out_dir/data and uses them
-  ieeg: synthetic      # puts SyntheticIEEG into the 1:1 alternation (M6 synthetic)
+  spike: {format: synthetic}   # writes synthetic shards to out_dir/data and uses them
+  ieeg: synthetic              # puts SyntheticIEEG into the 1:1 alternation (M6 synthetic)
 finetune:
   head: attn
   epochs: 5

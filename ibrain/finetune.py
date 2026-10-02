@@ -1,7 +1,8 @@
 """M4: downstream velocity regression (SPEC 1.8, U8, U9, U11~U13, U27).
 Three arms: finetune (full-parameter fine-tuning from a pretraining checkpoint) /
 scratch (random init, same training) / ridge (linear regression on binned counts).
-Labels are the mean behavior (velocity) per 100 ms patch of the window, (S, 2) (U9)."""
+Labels are the mean behavior (velocity) per 100 ms patch of the window, (S, 2) (U9), z-scored per dimension
+with train-set statistics before training (U27). Reading NWB files and attaching labels is in data_nwb."""
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,50 +16,17 @@ from ibrain.repro import load_checkpoint, seed_all
 
 # ---------------- Labels and splits ----------------
 
-def patch_labels(start, ts, vel, n_patches=S, patch_seconds=0.1):
-    """U9: mean behavior per 100 ms patch from the window start (start, in s). ts (T,), vel (T, D) -> (S, D).
-    Patches with no samples are NaN. Adds 1e-6 patch (0.1 us) so a boundary sample (e.g. start + 0.1)
-    does not fall into the previous patch because of floating-point error."""
-    idx = np.floor((np.asarray(ts, dtype=np.float64) - start) / patch_seconds + 1e-6).astype(int)
-    keep = (idx >= 0) & (idx < n_patches)
-    vel = np.asarray(vel, dtype=np.float64)
-    sums = np.zeros((n_patches, vel.shape[1]))
-    np.add.at(sums, idx[keep], vel[keep])
-    n = np.bincount(idx[keep], minlength=n_patches)
-    return sums / np.where(n > 0, n, np.nan)[:, None]
-
-
-def read_nwb_velocity(path, name="hand_vel"):
-    """processing['behavior'][name] of an NLB NWB (DANDI 000128) -> (ts (T,), vel (T, 2)).
-    Not verified on real data: check in the M4 real-data stage once corpus access is available (SPEC M4)."""
-    from pynwb import NWBHDF5IO
-    with NWBHDF5IO(str(path), "r", load_namespaces=True) as io:
-        series = io.read().processing["behavior"][name]
-        data = np.asarray(series.data[:], dtype=np.float64)
-        if series.timestamps is not None:
-            ts = np.asarray(series.timestamps[:], dtype=np.float64)
-        else:
-            ts = series.starting_time + np.arange(len(data)) / series.rate
-    return ts, data
-
-
-def attach_velocity(windows, ts, vel):
-    """Attaches the patch label "vel" to corpus windows (start_seconds). Windows with empty (NaN) labels are dropped."""
-    out = []
-    for w in windows:
-        y = patch_labels(w["start_seconds"], ts, vel)
-        if not np.isnan(y).any():
-            out.append({**w, "vel": y})
-    return out
-
-
 def split_trials(windows, frac=0.8, seed=0):
-    """U11: random 80/20 split by trial (interval_id).
-    seed is fixed independently of the run seed so that the three arms share the same split (M4)."""
-    ids = sorted({w["interval_id"] for w in windows})
+    """U11: random 80/20 split by trial. A trial is (session_id, interval_id), because trial numbers repeat
+    across sessions (Perich has one file per session). seed is fixed independently of the run seed so that
+    the three arms share the same split (M4)."""
+    def key(w):
+        return w["session_id"], w["interval_id"]
+
+    ids = sorted({key(w) for w in windows})
     np.random.default_rng(seed).shuffle(ids)
     train = set(ids[: int(round(frac * len(ids)))])
-    return [w for w in windows if w["interval_id"] in train], [w for w in windows if w["interval_id"] not in train]
+    return [w for w in windows if key(w) in train], [w for w in windows if key(w) not in train]
 
 
 def synthetic_labeled(n_trials=200, n_units=30, seed=0):
@@ -78,17 +46,19 @@ def synthetic_labeled(n_trials=200, n_units=30, seed=0):
 
 
 class LabeledWindows(Dataset):
-    """Window dict ("counts" [50, C], "vel" [S, 2]) -> ((C, S, P), (S, 2))."""
+    """Window dict ("counts" [50, C], "vel" [S, 2]) -> ((C, S, P), (S, 2)). Labels become (vel - mu) / sd."""
 
-    def __init__(self, windows):
+    def __init__(self, windows, mu=0.0, sd=1.0):
         self.w = list(windows)
+        self.mu, self.sd = mu, sd
         assert all(not np.isnan(w["vel"]).any() for w in self.w), "NaN label: must be filtered out by attach_velocity"
 
     def __len__(self):
         return len(self.w)
 
     def __getitem__(self, i):
-        return to_patches(self.w[i]["counts"]), torch.as_tensor(self.w[i]["vel"], dtype=torch.float32)
+        y = (np.asarray(self.w[i]["vel"], dtype=np.float64) - self.mu) / self.sd
+        return to_patches(self.w[i]["counts"]), torch.as_tensor(y, dtype=torch.float32)
 
 
 def collate_labeled(batch):
@@ -215,16 +185,24 @@ def fit_arm(train, test, model_cfg, seed, ckpt=None, head="attn", frozen=False, 
         model.load_state_dict(load_checkpoint(ckpt, device)["model"])
     C = max(w["counts"].shape[1] for w in train + test)
     reg = Regressor(model, HEADS[head](model_cfg.get("d", 256), C), frozen)
+    # U27: z-score labels with train statistics. Raw velocities are tens to hundreds and the output layer cannot
+    # reach that scale at lr 1e-4. R² per dimension is unchanged by the same affine map on prediction and target.
+    Y = np.concatenate([np.asarray(w["vel"], dtype=np.float64) for w in train])
+    mu, sd = Y.mean(0), Y.std(0) + 1e-8
     g = torch.Generator().manual_seed(seed)
-    dl_tr = DataLoader(LabeledWindows(train), batch_size, shuffle=True, collate_fn=collate_labeled, generator=g)
-    dl_te = DataLoader(LabeledWindows(test), batch_size, collate_fn=collate_labeled)
+    dl_tr = DataLoader(LabeledWindows(train, mu, sd), batch_size, shuffle=True, collate_fn=collate_labeled,
+                       generator=g)
+    dl_te = DataLoader(LabeledWindows(test, mu, sd), batch_size, collate_fn=collate_labeled)
     hist = train_regressor(reg, dl_tr, epochs, lr, wd, device)
     return evaluate(reg, dl_te, device), hist
 
 
 def ridge_r2(train, test, lams=(1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0), seed=0):
-    """U13 baseline: binned counts of the patch (P*C) -> velocity, closed-form ridge. Features are standardized.
-    λ is chosen by an inner validation that re-splits train 80/20 by trial, then refit on all of train (U27)."""
+    """U13 baseline: binned counts of the patch (P*C) -> velocity, closed-form ridge, ONE DECODER PER SESSION: units are
+    different neurons in every session, so stacking them into shared feature columns would pool unrelated neurons (or
+    fail when unit counts differ). Features are standardized per session. One λ for all sessions, chosen on an inner
+    validation that re-splits train 80/20 by trial, then every session is refit on all of its train windows (U27).
+    R² is over all test patches pooled across sessions, as for the neural arms."""
     def xy(ws):
         X = np.concatenate([np.asarray(w["counts"], np.float64).reshape(S, -1) for w in ws])  # (N*S, P*C)
         Y = np.concatenate([np.asarray(w["vel"], np.float64) for w in ws])  # (N*S, D)
@@ -236,10 +214,23 @@ def ridge_r2(train, test, lams=(1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0), seed=0):
         W = np.linalg.solve(Xs.T @ Xs + lam * np.eye(X.shape[1]), Xs.T @ (Y - ym))
         return lambda Z: ((Z - mu) / sd) @ W + ym
 
+    def by_session(ws):
+        out = {}
+        for w in ws:
+            out.setdefault(w["session_id"], []).append(w)
+        return out
+
+    def pooled(tr, te, lam):
+        """Fit each session on its tr windows, predict its te windows; (pred, target) pooled over sessions."""
+        trs, preds, ys = by_session(tr), [], []
+        for sess, ws in by_session(te).items():
+            if sess not in trs:
+                raise ValueError(f"session {sess!r} has held-out windows but no training windows")
+            Xt, Yt = xy(ws)
+            preds.append(fit(*xy(trs[sess]), lam)(Xt))
+            ys.append(Yt)
+        return np.concatenate(preds), np.concatenate(ys)
+
     inner_tr, inner_va = split_trials(train, 0.8, seed)
-    Xi, Yi = xy(inner_tr)
-    Xv, Yv = xy(inner_va)
-    lam = max(lams, key=lambda l: r2(fit(Xi, Yi, l)(Xv), Yv))
-    Xtr, Ytr = xy(train)
-    Xte, Yte = xy(test)
-    return r2(fit(Xtr, Ytr, lam)(Xte), Yte), lam
+    lam = max(lams, key=lambda l: r2(*pooled(inner_tr, inner_va, l)))
+    return r2(*pooled(train, test, lam)), lam
