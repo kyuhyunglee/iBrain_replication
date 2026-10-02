@@ -41,11 +41,13 @@ def lr_at(step, steps, warmup):
     return LR_MIN + 0.5 * (LR - LR_MIN) * (1 + math.cos(math.pi * t))
 
 
-def total_steps(epochs, n_spike_batches, n_loaders):
-    """Training length in steps (U20). One epoch = one pass over the spike loader. Under 1:1 alternation spike
+def total_steps(epochs, n_spike_batches, n_loaders, accum=1):
+    """Training length in optimizer steps (U20). One epoch = one pass over the spike loader. Under 1:1 alternation spike
     gets every n_loaders-th step, so the total is multiplied by n_loaders; the iEEG loader cycles as needed
-    (about 0.81 passes per epoch at paper scale). Same as zip(ieeg, spike) over 30 epochs."""
-    return epochs * n_spike_batches * n_loaders
+    (about 0.81 passes per epoch at paper scale). Same as zip(ieeg, spike) over 30 epochs.
+    With gradient accumulation (U33) one optimizer step consumes `accum` loader batches of one type. The spike step
+    count is rounded up over the whole run, so spike sees epochs x n_spike_batches batches plus fewer than accum extra."""
+    return -(-epochs * n_spike_batches // accum) * n_loaders
 
 
 def step_losses(model, x, valid, sig):
@@ -61,9 +63,12 @@ def step_losses(model, x, valid, sig):
     return rec, simsiam_loss(p1, q2, p2, q1)  # Eq. 12
 
 
-def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckpt_every=1000, resume=None, meta=None):
+def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckpt_every=1000, resume=None, meta=None,
+             accum=1):
     """loaders = [(sig, DataLoader), ...], batches are collate's (x, valid).
-    step t uses one batch from loaders[t % len(loaders)] (the 1:1 alternation of Eq. 13). Returns per-step records.
+    step t uses `accum` batches from loaders[t % len(loaders)] (the 1:1 alternation of Eq. 13): their losses are
+    averaged before one optimizer step, which gives the gradient of one batch accum times larger (U33; the paper's
+    8 GPUs x 32 per type = 256 per step is batch_size 32, accum 8 on one GPU). Returns per-step records.
     If out_dir is set: one line per step in log.jsonl, ckpt.pt (latest) every ckpt_every steps, final.pt at the end.
     resume is a ckpt path: restores model, optimizer, step, records and RNG state. Loader order is reshuffled (U26)."""
     model.to(device).train()
@@ -83,20 +88,23 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
     for t in range(start, steps):
         i = t % len(loaders)
         sig, dl = loaders[i]
-        batch = next(its[i], None)
-        if batch is None:  # end of a pass, reshuffle and cycle (U20)
-            its[i] = iter(dl)
-            batch = next(its[i])
-        x, valid = batch[0].to(device), batch[1].to(device)
         lr = lr_at(t, steps, warmup)
         for g in opt.param_groups:
             g["lr"] = lr
-        rec, align = step_losses(model, x, valid, sig)
         opt.zero_grad()  # set_to_none: the inactive type's encoder/decoder/type_emb keep grad None, AdamW skips them (U24)
-        (rec + align).backward()
+        rec_sum = align_sum = 0.0
+        for _ in range(accum):
+            batch = next(its[i], None)
+            if batch is None:  # end of a pass, reshuffle and cycle (U20)
+                its[i] = iter(dl)
+                batch = next(its[i])
+            x, valid = batch[0].to(device), batch[1].to(device)
+            rec, align = step_losses(model, x, valid, sig)
+            ((rec + align) / accum).backward()
+            rec_sum, align_sum = rec_sum + rec.item(), align_sum + align.item()
         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         opt.step()
-        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec.item(), "align": align.item()})
+        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum})
         if log:
             log.write(json.dumps(hist[-1]) + "\n")
             log.flush()

@@ -2,8 +2,8 @@
 import numpy as np
 import torch
 
-from ibrain.finetune import (HEADS, Regressor, attach_velocity, fit_arm, patch_labels, r2, ridge_r2, split_trials,
-                             synthetic_labeled)
+from ibrain.data_nwb import attach_velocity, patch_labels
+from ibrain.finetune import HEADS, Regressor, fit_arm, r2, ridge_r2, split_trials, synthetic_labeled
 from ibrain.model import IBrain
 
 TINY = dict(d=32, H=4, ffn=64, L=1, d_proj=16)
@@ -65,3 +65,37 @@ def test_scratch_and_frozen_arms():
     assert s2 == score  # same seed gives the same result (U26)
     frozen, _ = fit_arm(tr, te, TINY, seed=0, frozen=True, epochs=3, lr=1e-3)
     assert np.isfinite(frozen)
+
+
+def test_split_keys_by_session():
+    """U11: trial numbers repeat across sessions, so a trial is (session_id, interval_id)."""
+    ws = [{**w, "session_id": sess} for sess in ("a", "b") for w in synthetic_labeled(10, 5)]
+    tr, te = split_trials(ws, 0.8, seed=0)
+    keys = lambda part: {(w["session_id"], w["interval_id"]) for w in part}  # noqa: E731
+    assert len(keys(tr)) == 16 and len(keys(te)) == 4  # 20 trials in total, not 10
+    assert not keys(tr) & keys(te)
+
+
+def test_label_scale_does_not_matter():
+    """U27: labels are z-scored with train statistics, so raw velocity units (mm/s, cm/s) do not change R²."""
+    ws = synthetic_labeled(200, 30, seed=0)
+    tr, te = split_trials(ws, 0.8, seed=0)
+    scale = lambda part, k: [{**w, "vel": w["vel"] * k} for w in part]  # noqa: E731
+    r1, _ = fit_arm(tr, te, TINY, seed=0, epochs=15, lr=1e-3)
+    r300, _ = fit_arm(scale(tr, 300), scale(te, 300), TINY, seed=0, epochs=15, lr=1e-3)
+    print(f"\nscratch R2 x1 {r1:.3f}, x300 {r300:.3f}")
+    assert r300 > 0.1 and abs(r300 - r1) < 0.02
+
+
+def test_ridge_is_per_session():
+    """Units are different neurons in every session. Session b has the same counts as session a but the opposite
+    velocity: separate decoders fit both, a decoder shared across sessions cancels out (R² near 0). Different unit
+    counts must not crash either (the Perich T-CO run has 6 sessions)."""
+    a = [{**w, "session_id": "a"} for w in synthetic_labeled(150, 20, seed=1)]
+    flipped = a + [{**w, "session_id": "b", "vel": -w["vel"]} for w in a]
+    diff = [{**w, "session_id": "a"} for w in synthetic_labeled(150, 30, seed=1)] + \
+           [{**w, "session_id": "b"} for w in synthetic_labeled(150, 20, seed=2)]
+    for ws in (flipped, diff):
+        tr, te = split_trials(ws, 0.8, seed=0)
+        score, _ = ridge_r2(tr, te)
+        assert score > 0.8, score

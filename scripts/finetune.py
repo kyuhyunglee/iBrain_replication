@@ -1,6 +1,7 @@
 """M4 downstream. Three arms (finetune / scratch / ridge) × seeds, same trial split. Results in out/results.json.
 Example: python scripts/finetune.py --config configs/tiny.yaml --ckpt runs/tiny_s0/final.pt --out runs/ft_tiny --synthetic
-Real data: --corpus <root> --source dandi:000128 --nwb <NLB train NWB>  (real data unverified, SPEC M4)"""
+Real data: --nwb <files or folders> --behavior hand_vel (NLB MC-Maze, Area2-Bump) or cursor_vel (Perich).
+Files without that behavior series (NLB test files) are skipped. Not yet run on real data (SPEC M4)."""
 import argparse
 import sys
 from pathlib import Path
@@ -11,8 +12,8 @@ import numpy as np
 import torch
 import yaml
 
-from ibrain.data_spike import read_windows
-from ibrain.finetune import attach_velocity, fit_arm, read_nwb_velocity, ridge_r2, split_trials, synthetic_labeled
+from ibrain.data_nwb import MissingSeries, nwb_files, read_nwb
+from ibrain.finetune import fit_arm, ridge_r2, split_trials, synthetic_labeled
 from ibrain.repro import run_meta, write_json
 
 
@@ -22,23 +23,33 @@ def main():
     ap.add_argument("--ckpt", default=None, help="Pretraining checkpoint. If absent, the finetune arm is skipped")
     ap.add_argument("--out", required=True)
     ap.add_argument("--synthetic", action="store_true")
-    ap.add_argument("--corpus", default=None)
-    ap.add_argument("--source", default="dandi:000128")
-    ap.add_argument("--nwb", default=None)
+    ap.add_argument("--nwb", nargs="+", default=None, help="NWB files or folders (searched recursively)")
+    ap.add_argument("--behavior", default="hand_vel", help="TimeSeries to decode: hand_vel (NLB), cursor_vel (Perich)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = ap.parse_args()
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8"))
     fc = cfg["finetune"]
     out = Path(a.out)
-    write_json(out / "meta.json", {**run_meta(cfg, None), "ckpt": a.ckpt})
-
     if a.synthetic:
-        windows = synthetic_labeled(200, 30, seed=fc["split_seed"])
+        windows, used = synthetic_labeled(200, 30, seed=fc["split_seed"]), []
     else:
-        ts, vel = read_nwb_velocity(a.nwb)
-        windows = attach_velocity(list(read_windows(a.corpus, a.source)), ts, vel)
+        if not a.nwb:
+            ap.error("give --nwb or --synthetic")
+        windows, used = [], []
+        for f in nwb_files(a.nwb):
+            try:
+                ws = read_nwb(f, a.behavior)
+            except MissingSeries:
+                print(f"skip {f.name}: no {a.behavior!r} series (no labels)")
+                continue
+            print(f"{f.name}: {len(ws)} windows, {ws[0]['counts'].shape[1] if ws else 0} units")
+            windows += ws
+            used.append(str(f))
+        if not windows:
+            sys.exit(f"no labeled windows found for behavior {a.behavior!r}")
+    write_json(out / "meta.json", {**run_meta(cfg, None), "ckpt": a.ckpt, "behavior": a.behavior, "nwb_files": used})
     train, test = split_trials(windows, 0.8, fc["split_seed"])  # all three arms use the same split (M4)
-    print(f"windows train={len(train)} test={len(test)}")
+    print(f"sessions={len({w['session_id'] for w in windows})} windows train={len(train)} test={len(test)}")
 
     results = {"split_seed": fc["split_seed"], "n_train": len(train), "n_test": len(test), "arms": {}}
     score, lam = ridge_r2(train, test, seed=fc["split_seed"])
