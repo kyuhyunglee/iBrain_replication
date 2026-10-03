@@ -51,20 +51,23 @@ sbatch scripts/pretrain.sbatch configs/paper.yaml 0 runs/spike_s0 --spike-only
 The pile is held in memory, so set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
 Checkout `configs/paper.yaml` for all configurations available.
 
-### Evaluating on MC-Maze
-To evaluate you first need the NLB MC-Maze files from [DANDI 000128](https://dandiarchive.org/dandiset/000128). The spikes and the hand velocity labels are both read from the NWB files.
+### Downstream evaluation
+Every downstream dataset is an entry under `finetune.datasets` in the config, with a `format` and the options of that format. `configs/paper.yaml` lists the eight benchmarks of the paper:
 
-Then you can run the three arms (fine-tuning from the checkpoint, the same model from scratch, and ridge regression on binned counts) by running:
+| Name | Format | Options |
+|---|---|---|
+| `mc_maze`, `area2_bump` | `nwb` | `root`, `behavior: hand_vel` |
+| `perich_tco`, `perich_trt` | `nwb` | `root`, `glob: "sub-T/*ses-CO*.nwb"` (or `*ses-RT*`), `behavior: cursor_vel` |
+| `treebank` | `treebank` | `root`, `split: heldout`, `cache_dir`, optional `tasks` and `subjects` |
+
+`--dataset` picks one or more of them by name, and leaving it out runs all of them. Each one writes `out/<name>/meta.json` and `out/<name>/results.json`:
 
 ```bash
-python scripts/finetune.py --config configs/paper.yaml --ckpt runs/paper_s0/final.pt --out runs/ft_mcmaze_s0 \
-    --nwb /path/to/MC_Maze --behavior hand_vel
+python scripts/finetune.py --config configs/paper.yaml --ckpt runs/joint_s0/final.pt --out runs/ft_s0 --dataset mc_maze treebank
 ```
 
-A folder is searched for `.nwb` files, and files without the behavior series, such as the NLB test file, are skipped.
-All arms share one trial-level 80/20 split. R² for every arm and seed goes to `runs/ft_mcmaze_s0/results.json`.
-Area2-Bump ([DANDI 000127](https://dandiarchive.org/dandiset/000127)) works the same way. For the Perich T-CO and T-RT tasks ([DANDI 000688](https://dandiarchive.org/dandiset/000688)), pass the monkey T files of one task, for example `sub-T/*ses-CO*`, and use `--behavior cursor_vel`.
-To check the evaluation code without data, replace the last two flags with `--synthetic`.
+For the spike benchmarks ([DANDI 000128](https://dandiarchive.org/dandiset/000128), [000127](https://dandiarchive.org/dandiset/000127), [000688](https://dandiarchive.org/dandiset/000688)), the spikes and the velocity labels are both read from the NWB files, and files without the behavior series, such as the NLB test file, are skipped. Three arms (fine-tuning from the checkpoint, the same model from scratch, and ridge regression on binned counts) share one trial-level 80/20 split and report R².
+`configs/tiny.yaml` has a `synthetic` entry for checking the evaluation code without data.
 The NWB reader has been tested on synthetic files in both layouts but not yet on the real files, so expect to touch it on the first try.
 
 ### Joint pretraining with iEEG
@@ -78,7 +81,7 @@ sbatch scripts/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
 ```
 
 ### Brain Treebank
-The [Brain Treebank](https://braintreebank.dev) reader builds the Pitch, Volume, Onset and Speech examples with the PopT rules, cut to 1 s windows at 500 Hz (SPEC U34). `ibrain.data_treebank.split_subject(root, "sub_1", "speech", cache_dir=...)` returns train, val and test windows, testing on the subject's held-out PopT trial. A command-line entry point and the classification head with AUC are not implemented yet.
+The `treebank` entry builds the Pitch, Volume, Onset and Speech examples of the [Brain Treebank](https://braintreebank.dev) with the PopT rules, cut to 1 s windows at 500 Hz (SPEC U34). Each of the 7 subjects with more than one trial is fine-tuned on its other trials and tested on its held-out PopT trial. The model encodes with the iEEG encoder and iEEG type embedding of pretraining, the head gives one logit per window, and the score is AUC averaged over subjects (SPEC U35). Only the three neural arms run; there is no linear baseline. With `cache_dir`, every trial is read and filtered once for all four tasks.
 
 ## Cite
 This repository is not affiliated with the iBrain authors. Please cite [their paper](https://arxiv.org/abs/2609.06960) if you use this code in your own work:
