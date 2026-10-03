@@ -77,7 +77,8 @@ Then you can run the paper's joint pretraining, alternating spike and iEEG batch
 sbatch scripts/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
 ```
 
-The Brain Treebank downstream tasks are not implemented yet.
+### Brain Treebank
+The [Brain Treebank](https://braintreebank.dev) reader builds the Pitch, Volume, Onset and Speech examples with the PopT rules, cut to 1 s windows at 500 Hz (SPEC U34). `ibrain.data_treebank.split_subject(root, "sub_1", "speech", cache_dir=...)` returns train, val and test windows, testing on the subject's held-out PopT trial. A command-line entry point and the classification head with AUC are not implemented yet.
 
 ## Cite
 This repository is not affiliated with the iBrain authors. Please cite [their paper](https://arxiv.org/abs/2609.06960) if you use this code in your own work:
