@@ -14,7 +14,8 @@ import torch
 from scipy.signal import resample_poly
 
 from ibrain.data_ieeg import FS, channel_normalize, channel_stats
-from ibrain.data_treebank import (TASKS, TB_FS, TreebankWindows, collate_treebank, neighbours, nonword_centers,
+from ibrain import data_treebank
+from ibrain.data_treebank import (NOTCH_HZ, TASKS, TB_FS, TreebankWindows, collate_treebank, neighbours, nonword_centers,
                                   quartile_examples, read_trial, read_trials, read_words, sample_index,
                                   select_electrodes, split_subject, stem, task_examples)
 
@@ -25,6 +26,7 @@ DURATION, LAG = 150.0, 7.45  # s of recording; s from recording start to movie t
 # away from the 1 s grid, so the 2-sample trigger jitter cannot move a word across an interval boundary)
 BREAKS = [(62.04, 4.0), (95.02, 3.0)]  # (movie time, s the recording runs on): a pause, then an end/beginning pair
 N_BLOCKS, N_WORDS = 12, 10
+POPT = dict(reref="laplacian", notch_hz=NOTCH_HZ)  # the PopT signal variant; the default is no notch, no re-reference
 
 
 def rec_seconds(m):
@@ -186,12 +188,13 @@ def test_select_electrodes(tmp_path):
 
 
 def test_window_values(tmp_path):
-    """Without notch and re-reference a window is exactly the U4-normalized 500 Hz signal around the onset."""
+    """Main condition (the defaults: no notch, no re-reference): a window is exactly the U4-normalized 500 Hz signal
+    around the onset."""
     truth = write_treebank(tmp_path, trials=("trial000",))
     raw = truth["trial000"][1]["B2"]
     y = resample_poly(raw[None], 125, 512, axis=1)
     y = channel_normalize(y, *channel_stats(y))[0]
-    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["B2"], notch_hz=(), reref="none")
+    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["B2"])
     for w in ws[:5] + ws[-5:]:
         a = int(round(w["center_seconds"] * FS)) - FS // 2
         assert np.allclose(w["wave"][0], y[a:a + FS], atol=1e-4)
@@ -200,7 +203,7 @@ def test_window_values(tmp_path):
 @pytest.mark.parametrize("task", TASKS)
 def test_read_trial(tmp_path, task):
     write_treebank(tmp_path, trials=("trial000",))
-    ws = read_trial(tmp_path, "sub_1", "trial000", task, electrodes=SEL)
+    ws = read_trial(tmp_path, "sub_1", "trial000", task, electrodes=SEL, **POPT)
     y = np.array([w["label"] for w in ws])
     n_words, neg = N_BLOCKS * N_WORDS - 1, expected_nonword_seconds()
     expect = {"pitch": int(n_words / 4) + n_words - int(3 * n_words / 4), "volume": None,
@@ -224,8 +227,8 @@ def test_read_trial(tmp_path, task):
 
 def test_laplacian_removes_common_signal(tmp_path):
     write_treebank(tmp_path, trials=("trial000",))
-    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["A2"], notch_hz=())
-    raw = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["A2"], notch_hz=(), reref="none")
+    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["A2"], reref="laplacian")
+    raw = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["A2"])
     # The shared 0.7 Hz component dominates the raw channel; after the Laplacian only white noise is left.
     lag1 = lambda x: np.mean([np.corrcoef(w["wave"][0, :-1], w["wave"][0, 1:])[0, 1] for w in x])
     assert lag1(raw) > 0.9 and lag1(ws) < 0.9
@@ -249,6 +252,80 @@ def test_stat_chunks_change_normalization(tmp_path):
     chunked = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=["B2"], stat_seconds=30)
     assert len(whole) == len(chunked)
     assert not all(np.array_equal(u["wave"], v["wave"]) for u, v in zip(whole, chunked))
+
+
+def overwrite(root, trial, edits):
+    """Replace parts of written raw signals: edits {label: f(x) -> x}."""
+    with h5py.File(root / f"sub_1_{trial}.h5", "r+") as h:
+        for e, f in edits.items():
+            d = h["data"][f"electrode_{ELECS.index(e)}"]
+            d[:] = f(d[:])
+
+
+def flat(a, b):
+    def f(x):
+        x[int(a * TB_FS):int(b * TB_FS)] = 0.0
+        return x
+    return f
+
+
+def test_flat_laplacian_channel_is_left_out(tmp_path, capsys):
+    """PopT variant: three neighbouring contacts constant for 60% of the trial make the middle one's Laplacian 0 there,
+    so its scale is 0 (the review case: values up to ~2e6 after normalization). It becomes 0 and invalid in place, so
+    the other channels keep their positions."""
+    write_treebank(tmp_path, trials=("trial000",))
+    overwrite(tmp_path, "trial000", {e: flat(0, 0.6 * DURATION) for e in ("A2", "A3", "A4")})
+    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=SEL, **POPT)
+    assert "A3 left out of 1 of 1 statistics chunk(s)" in capsys.readouterr().out
+    ok = np.array([w["channel_ok"] for w in ws])
+    assert (ok[:, SEL.index("A3")] == 0).all() and ok[:, [i for i, e in enumerate(SEL) if e != "A3"]].all()
+    x, valid, _ = collate_treebank([TreebankWindows(ws)[i] for i in range(len(ws))])
+    a3 = SEL.index("A3")
+    assert x.shape[1] == len(SEL) and x.abs().max() < 1e3 and (x[:, a3] == 0).all()
+    assert not valid[:, a3].any() and valid[:, [i for i in range(len(SEL)) if i != a3]].all()
+    # With 30 s chunks only the chunks inside the flat stretch leave A3 out.
+    ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=SEL, stat_seconds=30, **POPT)
+    late = np.array([w["center_seconds"] > 0.6 * DURATION for w in ws])
+    a3 = np.array([w["channel_ok"][SEL.index("A3")] for w in ws])
+    assert a3[late].all() and not a3[~late].any()
+
+
+def test_nan_channel_is_left_out_and_drops_counted(tmp_path, capsys):
+    """PopT variant: one NaN sample turns the rest of the notched trace into NaN, and the Laplacian spreads it to the
+    two neighbours.
+    Those channels are left out of the trial (under 30 s of finite samples) and the windows are kept; a NaN late in
+    the trial keeps the channels and drops the windows after it, with the count printed."""
+    write_treebank(tmp_path, trials=("trial000",))
+    clean = read_trial(tmp_path, "sub_1", "trial000", "pitch", electrodes=SEL, **POPT)
+
+    def nan_at(t):
+        def f(x):
+            x[int(t * TB_FS)] = np.nan
+            return x
+        return f
+    overwrite(tmp_path, "trial000", {"A3": nan_at(10.0)})
+    capsys.readouterr()
+    ws = read_trial(tmp_path, "sub_1", "trial000", "pitch", electrodes=SEL, **POPT)
+    assert len(ws) == len(clean)
+    assert [e for e, k in zip(SEL, ws[0]["channel_ok"]) if not k] == ["A2", "A3", "A4"]
+    assert "windows dropped" not in capsys.readouterr().out
+    overwrite(tmp_path, "trial000", {"A3": lambda x: np.nan_to_num(x)})
+    overwrite(tmp_path, "trial000", {"A3": nan_at(120.0)})
+    ws = read_trial(tmp_path, "sub_1", "trial000", "pitch", electrodes=SEL, **POPT)
+    late = sum(w["center_seconds"] > 119.5 for w in clean)
+    assert late > 0 and len(ws) == len(clean) - late and all(w["channel_ok"].all() for w in ws)
+    assert f"{late} of {len(clean)} windows dropped (0 outside the recording, {late} with a non-finite sample" \
+        in capsys.readouterr().out
+
+
+def test_cache_name_has_code_version(tmp_path, monkeypatch):
+    write_treebank(tmp_path, trials=("trial000",))
+    read_trials(tmp_path, "sub_1", "trial000", ("speech",), electrodes=SEL, cache_dir=tmp_path / "cache")
+    meta = json.loads(next((tmp_path / "cache").glob("*.json")).read_text())
+    assert meta["code"] == data_treebank.code_version() and "dropped" in meta
+    monkeypatch.setattr(data_treebank, "_CODE", ["changed"])  # other code: the old cache is not loaded
+    read_trials(tmp_path, "sub_1", "trial000", ("speech",), electrodes=SEL, cache_dir=tmp_path / "cache")
+    assert len(list((tmp_path / "cache").glob("*.npy"))) == 2
 
 
 # ---------------- Splits and Dataset ----------------
@@ -281,3 +358,31 @@ def test_dataset_collate(tmp_path):
     ws = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=SEL)
     x, valid, y = collate_treebank([TreebankWindows(ws)[i] for i in range(4)])
     assert x.shape == (4, len(SEL), 10, 50) and valid.all() and y.dtype == torch.float32
+    # Invalid channels (channel_ok False) and padding (a window with fewer channels) are both valid False.
+    ws[1] = {**ws[1], "channel_ok": np.array([True, False, True, True, True])}
+    ws[2] = {**ws[2], "wave": ws[2]["wave"][:3], "channel_ok": np.ones(3, bool)}
+    x, valid, _ = collate_treebank([TreebankWindows(ws)[i] for i in range(3)])
+    assert valid.tolist() == [[True] * 5, [True, False, True, True, True], [True] * 3 + [False] * 2]
+
+
+def test_invalid_channel_equals_absent_channel():
+    """A channel with valid False changes no other channel's output and no head output: the model gives the same window
+    logit as with the channel removed (the pretraining streams' treatment), for any values in it."""
+    from ibrain.finetune import HEADS, Regressor, WindowLogit
+    from ibrain.model import IEEG, IBrain
+    cfg = dict(d=32, H=4, ffn=64, L=2, d_proj=16)
+    torch.manual_seed(0)
+    model = IBrain(**cfg).eval()
+    x = torch.randn(2, 5, 10, 50)
+    for head in ("attn", "mean"):
+        clf = Regressor(model, WindowLogit(HEADS[head](32, 5, out=1)), False, sig=IEEG).eval()
+        valid = torch.ones(2, 5, dtype=torch.bool)
+        valid[:, 2] = False
+        keep = [0, 1, 3, 4]
+        with torch.no_grad():
+            a = clf(x, valid)
+            b = clf(x[:, keep], torch.ones(2, 4, dtype=torch.bool))
+            x2 = x.clone()
+            x2[:, 2] = 1e6
+            c = clf(x2, valid)
+        assert torch.allclose(a, b, atol=1e-5) and torch.allclose(a, c, atol=1e-5)

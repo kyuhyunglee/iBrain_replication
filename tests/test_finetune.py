@@ -21,7 +21,7 @@ from ibrain.finetune import (HEADS, AttnPoolHead, Regressor, WindowLogit, auc, f
 from ibrain.model import IEEG, SPIKE, IBrain
 from ibrain.pretrain import pretrain
 from ibrain.repro import load_checkpoint
-from test_treebank import SEL, write_treebank
+from test_treebank import POPT, SEL, write_treebank
 
 ROOT = Path(__file__).resolve().parent.parent
 TINY = dict(d=32, H=4, ffn=64, L=1, d_proj=16)
@@ -190,8 +190,8 @@ def test_ieeg_steps_of_spike_only_checkpoint(tmp_path):
 
 def test_classifier_learns_synthetic_treebank(tmp_path):
     write_treebank(tmp_path, trials=("trial000", "trial001"))
-    train = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=SEL)
-    test = read_trial(tmp_path, "sub_1", "trial001", "speech", electrodes=SEL)
+    train = read_trial(tmp_path, "sub_1", "trial000", "speech", electrodes=SEL, **POPT)
+    test = read_trial(tmp_path, "sub_1", "trial001", "speech", electrodes=SEL, **POPT)
     score, hist = fit_classifier_arm(train, test, TINY, seed=0, epochs=15, lr=1e-3)
     print(f"\nscratch speech AUC {score:.3f} loss {hist[0]:.3f} -> {hist[-1]:.3f}")
     assert hist[-1] < hist[0] and score > 0.7
@@ -207,8 +207,8 @@ def test_finetune_script_on_treebank(tmp_path):
     cfg["model"] = {**cfg["model"], **TINY}
     cfg["finetune"].update(seeds=[0, 1], epochs=3)
     cfg["finetune"]["datasets"]["tb"] = {"format": "treebank", "root": str(tmp_path / "tb"), "split": "heldout",
-                                         "tasks": ["speech"], "subjects": ["sub_1"],
-                                         "cache_dir": str(tmp_path / "cache")}
+                                         "tasks": ["speech"], "subjects": ["sub_1"], "stat_seconds": 30,
+                                         "notch_hz": [60], "cache_dir": str(tmp_path / "cache")}
     (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
     out = tmp_path / "ft"
     r = subprocess.run([sys.executable, str(ROOT / "scripts/finetune.py"), "--config", str(tmp_path / "cfg.yaml"),
@@ -227,3 +227,29 @@ def test_finetune_script_on_treebank(tmp_path):
         assert v["auc_by_seed"] == sub["arms"][name]["auc"]  # one subject: the subject mean is that subject
         assert all(0.0 <= s <= 1.0 for s in v["auc_by_seed"]) and len(v["auc_by_seed"]) == 2
     assert len(list((tmp_path / "cache").glob("*.npy"))) == 2  # both trials cached once for the task
+    assert res["complete"] and all(v["n_subjects"] == 1 for v in arms.values())
+    for f in (tmp_path / "cache").glob("*.json"):  # the reader options reach the reader
+        c = json.loads(f.read_text())
+        assert c["stat_seconds"] == 30 and c["notch_hz"] == [60]
+
+
+def test_finetune_script_rejects_unknown_option(tmp_path):
+    cfg = yaml.safe_load((ROOT / "configs/tiny.yaml").read_text())
+    cfg["finetune"]["datasets"]["tb"] = {"format": "treebank", "root": str(tmp_path), "stat_second": 675}
+    (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/finetune.py"), "--config", str(tmp_path / "cfg.yaml"),
+                        "--out", str(tmp_path / "ft"), "--dataset", "tb", "--device", "cpu"],
+                       capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode != 0 and "unknown option(s) ['stat_second']" in r.stderr
+    assert not (tmp_path / "ft").exists()
+
+
+def test_finetune_script_skips_variants_by_default(tmp_path):
+    """An entry with variant: true (treebank_popt in paper.yaml) runs only when --dataset names it."""
+    cfg = yaml.safe_load((ROOT / "configs/tiny.yaml").read_text())
+    cfg["finetune"]["datasets"] = {"tb_popt": {"format": "treebank", "variant": True, "root": str(tmp_path),
+                                               "reref": "laplacian"}}
+    (tmp_path / "cfg.yaml").write_text(yaml.safe_dump(cfg))
+    r = subprocess.run([sys.executable, str(ROOT / "scripts/finetune.py"), "--config", str(tmp_path / "cfg.yaml"),
+                        "--out", str(tmp_path / "ft"), "--device", "cpu"], capture_output=True, text=True, cwd=ROOT)
+    assert r.returncode != 0 and "unknown or no dataset" in r.stderr
