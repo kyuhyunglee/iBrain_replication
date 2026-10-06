@@ -6,14 +6,23 @@ at 500 Hz:
   pitch / volume: the words of one trial sorted by `pitch` / `rms`; the bottom quarter is 0, the top quarter is 1.
   onset: 1 = first word of a sentence (is_onset); 0 = a 1 s stretch of the movie grid that overlaps no word. Balanced.
   speech: 1 = any word; 0 = as for onset. Balanced.
-A window is 1 s centered on the word onset (PopT centers its 5 s window) or on the non-word stretch.
-Signal: the PopT electrodes (BrainBERT's clean Laplacian rule), notch at 60 Hz and harmonics up to 360 Hz, Laplacian
-re-reference (minus the mean of the two neighbouring contacts on the same shaft), 2048 -> 500 Hz, then U4
-normalization.
-Each trial is one recording; window dicts have the same role as data_nwb's, with "wave" (C, 500) and "label" 0/1."""
+A window is 1 s centered on the word onset (PopT centers its 5 s window) or on the non-word stretch. The non-word
+grid and its margin from the recording ends are 1 s too (PopT: 5 s), so the negatives are not PopT's.
+Signal (main condition, the same input as pretraining): the PopT electrodes (BrainBERT's clean Laplacian rule),
+2048 -> 500 Hz, then U4 normalization. A channel that is flat or mostly NaN in a statistics chunk
+(data_ieeg.usable_channels, the pretraining rule) is set to 0 there and marked channel_ok False, which collate turns
+into valid False: the model then ignores it exactly as a padded channel, the same as the pretraining streams leaving
+it out of the block, while every channel keeps its position (flatten head). No notch and no re-reference: the pretraining iEEG has neither
+added, and a shaft Laplacian cannot be built for SWEC (no channel metadata) or the AJILE12 grids.
+PopT variant (reref="laplacian", notch_hz=NOTCH_HZ): notch at 60 Hz and harmonics up to 360 Hz, then Laplacian
+re-reference (minus the mean of the two neighbouring contacts on the same shaft), as the PopT code.
+Each trial is one recording; window dicts have the same role as data_nwb's, with "wave" (C, 500), "channel_ok" (C,)
+and "label" 0/1."""
 import hashlib
+import inspect
 import json
 import random
+import warnings
 from collections import OrderedDict
 from pathlib import Path
 
@@ -21,7 +30,9 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ibrain.data_ieeg import FS, WINDOW_SAMPLES, channel_normalize, channel_stats, resample_to_fs, to_patches
+from ibrain import data_ieeg
+from ibrain.data_ieeg import (FS, WINDOW_SAMPLES, channel_normalize, channel_stats, resample_to_fs, to_patches,
+                              usable_channels)
 from ibrain.data_spike import collate
 
 TB_FS = 2048  # Hz, every Brain Treebank trial
@@ -160,7 +171,9 @@ def nonword_centers(start, end, n_native, length):
 def task_examples(words, n_native, task, fs=TB_FS, seconds=1.0):
     """One trial -> (centers (N,) native sample index, labels (N,) int) in PopT order. pitch / volume: word onsets of
     the two quartiles. onset / speech: positives (sentence onsets / all words) then non-word intervals, both subsampled
-    to the smaller count with random.seed(42) and random.sample, exactly as PopT."""
+    to the smaller count with random.seed(42) and random.sample as PopT. The non-word intervals are `seconds` long and
+    their centers more than `seconds` from the recording ends; PopT uses its 5 s window here, so with seconds = 1 the
+    candidate negatives (and hence the sampled ones) differ from PopT's."""
     if task in FEATURE:
         idx, y = quartile_examples(words[FEATURE[task]])
         return words["start"][idx], y
@@ -191,7 +204,7 @@ class _Traces:
     contacts, so they are reused by the next electrodes). Notch and resampling are linear and time-invariant per
     channel, so applying them before the Laplacian gives the same signal as PopT's order (notch, re-reference)."""
 
-    def __init__(self, path, labels, notch_hz=NOTCH_HZ, size=8):
+    def __init__(self, path, labels, notch_hz=(), size=8):
         self.path, self.index, self.notch_hz, self.size = path, {e: i for i, e in enumerate(labels)}, notch_hz, size
         self.cache = OrderedDict()
 
@@ -222,18 +235,34 @@ def stat_chunks(n, chunk_samples):
     return np.asarray(starts)
 
 
-def extract(trace, starts, chunk_of, chunks):
-    """Windows of one channel, normalized with the statistics of the chunk each window's center falls in (U4).
-    trace (T,), starts (N,) 500 Hz -> (N, 500) float32."""
-    out = np.empty((len(starts), WINDOW_SAMPLES), dtype=np.float32)
+def chunk_stats(trace, chunks):
+    """U4 statistics of one channel in each chunk -> center, scale, number of finite samples, each (K,)."""
     bounds = list(chunks[1:]) + [len(trace)]
-    for k, (a, z) in enumerate(zip(chunks, bounds)):
-        sel = chunk_of == k
-        if sel.any():
-            c, sc = channel_stats(trace[None, a:z])
-            w = trace[starts[sel, None] + np.arange(WINDOW_SAMPLES)]
-            out[sel] = channel_normalize(w, c, sc)
-    return out
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # an all-NaN chunk gives NaN statistics; usable_channels drops it
+        st = np.array([[v[0] for v in channel_stats(trace[None, a:z])] for a, z in zip(chunks, bounds)])
+    return st[:, 0], st[:, 1], np.array([np.isfinite(trace[a:z]).sum() for a, z in zip(chunks, bounds)])
+
+
+def extract(trace, starts, chunk_of, center, scale):
+    """Windows of one channel, normalized with the statistics of the chunk each window's center falls in (U4).
+    trace (T,), starts (N,) 500 Hz, center, scale (K,) from chunk_stats -> (N, 500) float32."""
+    w = trace[starts[:, None] + np.arange(WINDOW_SAMPLES)]
+    return channel_normalize(w, center[chunk_of], scale[chunk_of]).astype(np.float32)
+
+
+_CODE = []
+
+
+def code_version():
+    """Hash of the code behind the cached arrays: this file and the data_ieeg functions and constants it uses. Part of
+    every cache name, so a cache written by other code is never loaded (an edit to a comment here also renames it)."""
+    if not _CODE:
+        src = Path(__file__).read_text(encoding="utf-8") + "".join(
+            inspect.getsource(f) for f in (channel_stats, channel_normalize, resample_to_fs, usable_channels))
+        src += repr((FS, WINDOW_SAMPLES, data_ieeg.MIN_STAT_SECONDS, data_ieeg.MIN_SCALE_RATIO))
+        _CODE.append(hashlib.md5(src.encode()).hexdigest()[:10])
+    return _CODE[0]
 
 
 # ---------------- One trial ----------------
@@ -243,46 +272,54 @@ def read_trial(root, subject, trial, task, **kw):
     return read_trials(root, subject, trial, (task,), **kw)[task]
 
 
-def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="laplacian", notch_hz=NOTCH_HZ,
+def read_trials(root, subject, trial, tasks=TASKS, electrodes="popt", reref="none", notch_hz=(),
                 stat_seconds=None, drop_corrupted=False, cache_dir=None):
-    """One trial -> {task: list of window dicts {wave float32 (C, 500), label 0/1, center_seconds, subject, trial,
-    session_id, task, electrodes}}. The signal is read and filtered once for all tasks. Windows that do not fit in the
-    recording or contain a non-finite sample are dropped. reref: "laplacian" (PopT) or "none". stat_seconds: U4
-    statistics over chunks of this length (by window center) instead of the whole trial; it must match the
-    pretraining unit (SPEC U4). cache_dir: keeps each task's arrays as .npy (memory-mapped on reuse) under a name that
-    encodes every argument."""
+    """One trial -> {task: list of window dicts {wave float32 (C, 500), channel_ok bool (C,), label 0/1,
+    center_seconds, subject, trial, session_id, task, electrodes}}. The signal is read and filtered once for all tasks.
+    channel_ok is False for the electrodes not usable in the statistics chunk of the window (usable_channels: flat, or
+    under 30 s of finite samples); their samples are 0 and collate_treebank marks them invalid, so the model ignores
+    them as the pretraining streams do (which leave them out of the block). Windows that do not fit
+    in the recording, have a non-finite sample in a kept channel, or keep no channel are dropped; the counts are printed
+    and kept in the cache metadata. reref: "none" (main) or "laplacian" (PopT variant); notch_hz: () (main) or
+    NOTCH_HZ (PopT variant). stat_seconds: U4 statistics over chunks of
+    this length (by window center) instead of the whole trial; it must match the pretraining unit (SPEC U4).
+    cache_dir: keeps each task's arrays as .npy (memory-mapped on reuse) under a name that encodes every argument and
+    the code version."""
     root = Path(root)
     elecs = select_electrodes(root, subject, electrodes, drop_corrupted)
     out, todo, names = {}, [], {}
     for task in tasks:
         cfg = {"subject": subject, "trial": trial, "task": task, "electrodes": elecs, "reref": reref,
-               "notch_hz": list(notch_hz or ()), "stat_seconds": stat_seconds, "version": 1}
+               "notch_hz": list(notch_hz or ()), "stat_seconds": stat_seconds, "code": code_version()}
         names[task] = (cfg, f"{subject}_{trial}_{task}_{hashlib.md5(json.dumps(cfg).encode()).hexdigest()[:10]}")
         if cache_dir is not None and (Path(cache_dir) / f"{names[task][1]}.json").exists():
             meta = json.loads((Path(cache_dir) / f"{names[task][1]}.json").read_text())
             out[task] = (np.load(Path(cache_dir) / f"{names[task][1]}.npy", mmap_mode="r"), np.asarray(meta["labels"]),
-                         np.asarray(meta["centers"]))
+                         np.asarray(meta["centers"]), np.asarray(meta["chunk_of"]), np.asarray(meta["channel_ok"]))
         else:
             todo.append(task)
     if todo:
         new = _compute_trial(root, subject, trial, todo, elecs, reref, notch_hz, stat_seconds)
-        for task, (x, y, centers) in new.items():
+        for task, (x, y, centers, chunk_of, ok, dropped) in new.items():
             if cache_dir is not None:
                 cfg, name = names[task]
                 Path(cache_dir).mkdir(parents=True, exist_ok=True)
                 np.save(Path(cache_dir) / f"{name}.npy", x)
-                meta = {**cfg, "labels": y.tolist(), "centers": centers.tolist()}
+                meta = {**cfg, "labels": y.tolist(), "centers": centers.tolist(), "chunk_of": chunk_of.tolist(),
+                        "channel_ok": ok.tolist(), "dropped": dropped}
                 (Path(cache_dir) / f"{name}.json").write_text(json.dumps(meta))
-        out.update(new)
+            out[task] = (x, y, centers, chunk_of, ok)
     el = tuple(elecs)
-    return {task: [{"wave": x[i], "label": int(y[i]), "center_seconds": float(centers[i]) / TB_FS,
-                    "subject": subject, "trial": trial, "session_id": f"{subject}_{trial}", "task": task,
-                    "electrodes": el} for i in range(len(y))]
-            for task, (x, y, centers) in ((t, out[t]) for t in tasks)}
+    return {task: [{"wave": x[i], "channel_ok": ok[:, chunk_of[i]], "label": int(y[i]),
+                    "center_seconds": float(centers[i]) / TB_FS, "subject": subject, "trial": trial,
+                    "session_id": f"{subject}_{trial}", "task": task, "electrodes": el} for i in range(len(y))]
+            for task, (x, y, centers, chunk_of, ok) in ((t, out[t]) for t in tasks)}
 
 
 def _compute_trial(root, subject, trial, tasks, elecs, reref, notch_hz, stat_seconds):
-    """-> {task: (x (N, C, 500) float32, labels (N,), centers (N,) native samples)}, one pass over the electrodes."""
+    """-> {task: (x (N, C, 500) float32, labels (N,), centers (N,) native samples, chunk_of (N,), channel_ok (C, K),
+    dropped window counts)}, one pass over the electrodes. Prints the electrodes left out of a chunk and the dropped
+    windows."""
     import h5py
     if reref not in ("laplacian", "none"):
         raise ValueError(f"reref must be 'laplacian' or 'none', got {reref!r}")
@@ -301,18 +338,34 @@ def _compute_trial(root, subject, trial, tasks, elecs, reref, notch_hz, stat_sec
         starts = starts[fit]
         chunk_of = np.searchsorted(chunks, starts + WINDOW_SAMPLES // 2, side="right") - 1
         ex[task] = (centers[fit], y[fit], starts, chunk_of,
-                    np.empty((len(starts), len(elecs), WINDOW_SAMPLES), dtype=np.float32))
+                    np.empty((len(starts), len(elecs), WINDOW_SAMPLES), dtype=np.float32), int((~fit).sum()))
+    scale, n_finite = np.empty((len(elecs), len(chunks))), np.empty((len(elecs), len(chunks)), dtype=np.int64)
     trace = _Traces(path, labels, notch_hz)
     for c, e in enumerate(elecs):
         t = trace(e)
         if reref == "laplacian":
             t = t - np.mean([trace(n) for n in neighbours(e, labels)], axis=0)
-        for centers, y, starts, chunk_of, x in ex.values():
-            x[:, c] = extract(t, starts, chunk_of, chunks)
+        center, scale[c], n_finite[c] = chunk_stats(t, chunks)
+        for _, _, starts, chunk_of, x, _ in ex.values():
+            x[:, c] = extract(t, starts, chunk_of, center, scale[c])
+    ok = np.stack([usable_channels(n_finite[:, k], scale[:, k]) for k in range(len(chunks))], axis=1)  # (C, K)
+    for c in np.flatnonzero(~ok.all(1)):
+        print(f"{subject} {trial}: {elecs[c]} left out of {(~ok[c]).sum()} of {len(chunks)} statistics chunk(s) "
+              f"(flat or under {data_ieeg.MIN_STAT_SECONDS} s of finite samples)")
     out = {}
-    for task, (centers, y, _, _, x) in ex.items():
-        ok = np.isfinite(x).all(axis=(1, 2))
-        out[task] = (x, y, centers) if ok.all() else (x[ok], y[ok], centers[ok])
+    for task, (centers, y, _, chunk_of, x, outside) in ex.items():
+        keep = ok[:, chunk_of].T  # (N, C)
+        x[~keep] = 0.0  # unusable channel-chunks: 0, as a padded channel (a NaN or ~1e6 value would reach the model)
+        bad = (keep & ~np.isfinite(x).all(axis=2)).any(axis=1)
+        empty = ~keep.any(axis=1) & ~bad
+        sel = ~bad & ~empty
+        dropped = {"outside": outside, "nonfinite": int(bad.sum()), "no_channel": int(empty.sum())}
+        if sum(dropped.values()):
+            print(f"{subject} {trial} {task}: {sum(dropped.values())} of {len(y) + outside} windows dropped "
+                  f"({dropped['outside']} outside the recording, {dropped['nonfinite']} with a non-finite sample, "
+                  f"{dropped['no_channel']} with no usable channel)")
+        out[task] = ((x, y, centers, chunk_of) if sel.all() else (x[sel], y[sel], centers[sel], chunk_of[sel])) + (
+            ok, dropped)
     return out
 
 
@@ -343,7 +396,8 @@ def split_subject(root, subject, task, mode="heldout", seed=42, **kw):
 
 
 class TreebankWindows(Dataset):
-    """Window dicts -> ((C, S, P) float32, label float32 scalar). Waves are already normalized (U4)."""
+    """Window dicts -> ((C, S, P) float32, label float32 scalar, channel_ok (C,) bool). Waves are already normalized
+    (U4), with 0 in the channels whose channel_ok is False (all True when the dict has no channel_ok)."""
 
     def __init__(self, windows):
         self.w = list(windows)
@@ -352,10 +406,16 @@ class TreebankWindows(Dataset):
         return len(self.w)
 
     def __getitem__(self, i):
-        return to_patches(self.w[i]["wave"]), torch.tensor(float(self.w[i]["label"]))
+        w = self.w[i]
+        x = to_patches(w["wave"])
+        ok = w.get("channel_ok")
+        ok = torch.ones(len(x), dtype=torch.bool) if ok is None else torch.as_tensor(np.asarray(ok, dtype=bool))
+        return x, torch.tensor(float(w["label"])), ok
 
 
 def collate_treebank(batch):
-    """-> x (B, C, S, P), valid (B, C), y (B,). Channels are padded when a batch mixes subjects."""
+    """-> x (B, C, S, P), valid (B, C), y (B,). Channels are padded when a batch mixes subjects; valid is False for
+    padding and for channels with channel_ok False, so both are excluded the same way (V_c)."""
     x, valid = collate([b[0] for b in batch])
-    return x, valid, torch.stack([b[1] for b in batch])
+    ok = torch.nn.utils.rnn.pad_sequence([b[2] for b in batch], batch_first=True)
+    return x, valid & ok, torch.stack([b[1] for b in batch])

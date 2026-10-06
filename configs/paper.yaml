@@ -36,4 +36,7 @@ finetune:
     perich_trt: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
                  glob: "sub-T/*ses-RT*.nwb", behavior: cursor_vel}   # monkey T, random target, 6 sessions
     treebank:   {format: treebank, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
-                 split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache}  # U34, U35
+                 split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
+    treebank_popt: {format: treebank, variant: true, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
+                    split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache,
+                    reref: laplacian, notch_hz: [60, 120, 180, 240, 300, 360]}  # PopT signal condition (U34), only with --dataset treebank_popt
