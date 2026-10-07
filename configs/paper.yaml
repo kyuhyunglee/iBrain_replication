@@ -4,8 +4,11 @@ pretrain:
   steps: null          # if null, epochs × (spike loader batches) × (number of loaders) (U20)
   epochs: 30
   warmup: 2000
-  batch_size: 32       # per type per GPU (SPEC 1.6)
-  grad_accum: 8        # 32 x 8 = 256 per step = the paper's 8 GPUs x 32 (U33). 4 GPUs (lab max) would need 2
+  batch_size: 256      # random windows per type per optimizer step = the paper's 8 GPUs x 32 per type (U33)
+  grad_accum: 1
+  token_budget: 2048   # micro-batch size in channel slots (windows x their max units), cut by unit count (U33)
+  precision: bf16      # autocast of the model forward; weights, optimizer and losses stay fp32 (U36)
+  grad_checkpoint: false  # activation checkpointing (U37); true if the token_budget check fails
   ckpt_every: 1000
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
