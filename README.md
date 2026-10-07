@@ -54,7 +54,13 @@ Before loading data, the SLURM script checks that the largest micro-batches of `
 sbatch --time=02:00:00 --job-name=ibrain-smoke scripts/slurm/pretrain.sbatch configs/smoke.yaml 0 runs/smoke_s0
 ```
 
-The pile is held in memory, so set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
+Reading the parquet files takes about 30 minutes per run, so training reads a memory-mapped copy instead (`data.spike.format: pile_mmap`, SPEC U30). Make it once with a CPU job (about 40 GB on disk), then point `data.spike.root` at it:
+
+```bash
+sbatch scripts/slurm/pile_to_memmap.sbatch
+```
+
+It gives the same windows as reading the parquet files (`format: pile`), which still works. Set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
 Checkout `configs/paper.yaml` for all configurations available.
 
 ### Downstream evaluation
