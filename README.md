@@ -34,7 +34,7 @@ Checkout `configs/tiny.yaml` for all configurations available.
 
 ### Pretraining on spikes
 To pretrain on real spikes you first need the [Neural Pile primate](https://huggingface.co/datasets/eminorhan/neural-pile-primate) parquet files, the corpus the paper used.
-Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. As in the paper the whole pile is used, although it contains the Perich and Area2-Bump evaluation sessions; set `data.spike.exclude_sources: [perich, area2-bump]` for the variant without them. Each step averages 8 batches of 32 (`grad_accum`), the paper's 8 GPUs x 32.
+Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. As in the paper the whole pile is used, although it contains the Perich and Area2-Bump evaluation sessions; set `data.spike.exclude_sources: [perich, area2-bump]` for the variant without them. Each step uses 256 random windows per type, the paper's 8 GPUs x 32. Sessions differ in unit count (96 at the median, up to 1,734), so the 256 are computed in micro-batches of similar unit count with at most `token_budget` channel slots each; the gradient is the same as for the 256 at once (SPEC U33). Training runs in bf16 autocast (`precision`, U36), and `grad_checkpoint: true` trades about one extra forward for memory (U37).
 
 Then you can pretrain on spikes only by running:
 
@@ -45,7 +45,13 @@ python scripts/pretrain.py --config configs/paper.yaml --seed 0 --out runs/spike
 On the lab server, submit the same run through SLURM instead. GPU jobs must not be launched from a login shell.
 
 ```bash
-sbatch scripts/pretrain.sbatch configs/paper.yaml 0 runs/spike_s0 --spike-only
+sbatch scripts/slurm/pretrain.sbatch configs/paper.yaml 0 runs/spike_s0 --spike-only
+```
+
+Before loading data, the SLURM script checks that the largest micro-batches of `token_budget` fit on the GPU and stops if they do not. For a first run on the lab server use `configs/smoke.yaml` (200 pile rows, 0.5 h of each iEEG set, 200 steps):
+
+```bash
+sbatch --time=02:00:00 --job-name=ibrain-smoke scripts/slurm/pretrain.sbatch configs/smoke.yaml 0 runs/smoke_s0
 ```
 
 The pile is held in memory, so set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
@@ -77,7 +83,7 @@ Set the two `root` paths under `data.ieeg` in `configs/paper.yaml`. Recordings a
 Then you can run the paper's joint pretraining, alternating spike and iEEG batches, by leaving out `--spike-only`:
 
 ```bash
-sbatch scripts/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
+sbatch scripts/slurm/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
 ```
 
 ### Brain Treebank
