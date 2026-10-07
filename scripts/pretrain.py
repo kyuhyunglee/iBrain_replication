@@ -1,6 +1,7 @@
 """Run pretraining. Example: python scripts/pretrain.py --config configs/tiny.yaml --seed 0 --out runs/tiny_s0
-Spike data: Neural Pile (format pile), nhp-spike-corpus shards (corpus) or synthetic. iEEG data: a list of AJILE12 and
-SWEC sources streamed by block, "synthetic", or null. --spike-only ignores iEEG (M3).
+Spike data: Neural Pile (format pile, or pile_mmap for the converted copy of scripts/pile_to_memmap.py), nhp-spike-corpus
+shards (corpus) or synthetic. iEEG data: a list of AJILE12 and SWEC sources streamed by block, "synthetic", or null.
+--spike-only ignores iEEG (M3).
 Outputs: out/meta.json, log.jsonl, ckpt.pt (latest), final.pt. Resume with --resume out/ckpt.pt."""
 import argparse
 import itertools
@@ -14,7 +15,7 @@ import yaml
 from torch.utils.data import DataLoader, IterableDataset
 
 from ibrain.data_ieeg import IEEGStream, SyntheticIEEG, ajile12_blocks, select_hours, swec_blocks
-from ibrain.data_pile import PileWindows
+from ibrain.data_pile import PileMemmap, PileWindows
 from ibrain.data_spike import SYNTHETIC, SpikeWindows, collate, read_windows, write_synthetic
 from ibrain.model import IBrain, IEEG, SPIKE
 from ibrain.pretrain import pretrain, total_steps
@@ -26,9 +27,9 @@ IEEG_SOURCES = {"ajile12": ajile12_blocks, "swec": swec_blocks}
 def spike_data(sc, out, seed):
     """data.spike -> (Dataset, hours)."""
     fmt = sc["format"]
-    if fmt == "pile":
-        ds = PileWindows(sc["root"], sc.get("split", "train"), sc.get("exclude_sources", ()), sc.get("max_rows"),
-                         seed)
+    if fmt in ("pile", "pile_mmap"):  # pile_mmap: the converted copy of scripts/pile_to_memmap.py (U30)
+        reader = PileWindows if fmt == "pile" else PileMemmap
+        ds = reader(sc["root"], sc.get("split", "train"), sc.get("exclude_sources", ()), sc.get("max_rows"), seed)
         return ds, ds.hours
     if fmt == "corpus":
         ds = SpikeWindows(itertools.chain.from_iterable(read_windows(sc["root"], s) for s in sc["sources"]))

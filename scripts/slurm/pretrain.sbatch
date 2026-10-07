@@ -6,7 +6,8 @@
 #   sbatch scripts/slurm/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0                # M6
 # Resubmitting the same command resumes from <out>/ckpt.pt.
 # GPU nodes: node1 only (node3 is down). .venv points at uv's Python under the node-local /home, so it only runs on node1.
-# 12 CPUs x 5G = the per-GPU maximum. The Neural Pile is held in memory as uint8 (U30); 4 DataLoader workers per loader.
+# 12 CPUs x 5G = the per-GPU maximum; 4 DataLoader workers per loader. With format pile_mmap the pile is read through the
+# page cache (U30); format pile (parquet) holds it in process memory instead (39.9 GB for the whole train split).
 #SBATCH --job-name=ibrain-pretrain
 #SBATCH --partition=debug
 #SBATCH --nodelist=node1

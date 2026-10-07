@@ -15,11 +15,14 @@ pretrain:
 data:
   # Prefix confirmed on the server 2026-09-29 (iBrain_pretrain/). Folders below it are from the 09-28 survey.
   spike:
-    format: pile         # pile = Neural Pile primate parquet (U10, U30) | corpus = nhp-spike-corpus shards | synthetic
-    root: /storage/connectome/zres0710/iBrain_pretrain/spikes/neural-pile-primate
+    # pile_mmap = memory-mapped copy of the Neural Pile primate parquet files (U10, U30), made once by
+    # scripts/slurm/pile_to_memmap.sbatch | pile = the parquet files (root: .../iBrain_pretrain/spikes/neural-pile-primate,
+    # about 30 min to load) | corpus = nhp-spike-corpus shards | synthetic
+    format: pile_mmap
+    root: /scratch/connectome/zres0710/iBrain_cache/neural-pile-primate-mmap
     split: train
     exclude_sources: []   # as in the paper (U14). [perich, area2-bump] = variant without evaluation sessions
-    max_rows: null       # seeded random subset of rows for small runs. null = all rows, held in memory as uint8 (tens of GB)
+    max_rows: null       # seeded random subset of rows for small runs. null = all rows
   ieeg:                  # AJILE12 + SWEC, streamed by block (U31, U32). Skipped with --spike-only (M3)
     - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: null}
     - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: null}
