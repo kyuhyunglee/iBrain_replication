@@ -1,6 +1,7 @@
 """M3 verification: mask, channel views, lr schedule, loss decrease on synthetic shards."""
 import math
 
+import pytest
 import torch
 from torch.utils.data import DataLoader
 
@@ -197,38 +198,146 @@ def test_pack_budget():
     assert len(pack(n, None)) == 1
 
 
-def test_packed_gradient_equals_whole_batch(tmp_path, monkeypatch):
-    """U33: micro-batches with the loss weights of batch_losses give the whole-batch gradient. Masks and views are made
-    deterministic per window (same count as U15/U16) so both computations see the same draws; dropout is off."""
-    def mask_fn(valid, S):
-        B, C = valid.shape
-        tok = valid[:, :, None].expand(B, C, S).reshape(B, C * S)
-        rank = torch.arange(C * S).expand(B, -1).masked_fill(~tok, C * S)
-        return (rank < tok.sum(1, keepdim=True) // 2).view(B, C, S)
+def mask_fn(valid, S):
+    """Deterministic per window: the first half of the valid tokens (same count as U15)."""
+    B, C = valid.shape
+    tok = valid[:, :, None].expand(B, C, S).reshape(B, C * S)
+    rank = torch.arange(C * S).expand(B, -1).masked_fill(~tok, C * S)
+    return (rank < tok.sum(1, keepdim=True) // 2).view(B, C, S)
 
-    def views_fn(valid):
-        k = torch.arange(valid.shape[1])
-        return valid & (k % 3 != 1), valid & (k % 3 != 2)
 
-    monkeypatch.setattr(pt, "sample_mask", mask_fn)
-    monkeypatch.setattr(pt, "sample_views", views_fn)
+def views_fn(valid):
+    """Deterministic per window channel views (each drops every third channel, at different offsets)."""
+    k = torch.arange(valid.shape[1])
+    return valid & (k % 3 != 1), valid & (k % 3 != 2)
+
+
+def ragged_batch():
     torch.manual_seed(0)
     ns = [3, 40, 5, 17, 2, 40, 9, 1]
     x = torch.poisson(torch.full((len(ns), max(ns), 10, 5), 0.5))
     valid = valid_of(ns, max(ns))
     x[~valid] = 0.0
+    return x, valid
+
+
+def grads_of(m, fn):
+    m.zero_grad(set_to_none=True)
+    out = fn()
+    return out, [q.grad.clone() for q in m.parameters() if q.grad is not None]
+
+
+def same_grads(g0, g1, atol=1e-6):
+    return len(g0) == len(g1) and all(torch.allclose(u, v, atol=atol, rtol=1e-4) for u, v in zip(g0, g1))
+
+
+def close_grads(g0, g1, rel=1e-3):
+    """Per tensor, the error norm relative to the gradient norm. For BN heads: dividing by the std of a few windows
+    magnifies float32 rounding of r element-wise, while a wrong computation would be off by order 1."""
+    return len(g0) == len(g1) and all((u - v).norm() <= rel * u.norm() + 1e-8 for u, v in zip(g0, g1))
+
+
+def test_packed_gradient_equals_whole_batch(tmp_path, monkeypatch):
+    """U33: micro-batches with the loss weights of batch_losses give the whole-batch gradient. Masks and views are made
+    deterministic per window (same count as U15/U16) so both computations see the same draws; dropout is off."""
+    monkeypatch.setattr(pt, "sample_mask", mask_fn)
+    monkeypatch.setattr(pt, "sample_views", views_fn)
+    x, valid = ragged_batch()
     m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, p=0.0)
-
-    def grads(budget):
-        m.zero_grad(set_to_none=True)
-        losses = batch_losses(m, x, valid, SPIKE, budget=budget)
-        return losses, [q.grad.clone() for q in m.parameters() if q.grad is not None]
-
-    (r0, a0), g0 = grads(None)
-    (r1, a1), g1 = grads(45)  # several micro-batches, the two 40-unit windows each alone or paired
+    (r0, a0, q0), g0 = grads_of(m, lambda: batch_losses(m, x, valid, SPIKE, budget=None))
+    (r1, a1, q1), g1 = grads_of(m, lambda: batch_losses(m, x, valid, SPIKE, budget=45))  # 40-unit windows alone
     assert len(pack(valid.sum(1), 45)) > 2
     assert math.isclose(r0, r1, rel_tol=1e-5) and math.isclose(a0, a1, rel_tol=1e-5)
-    assert len(g0) == len(g1) and all(torch.allclose(u, v, atol=1e-6, rtol=1e-4) for u, v in zip(g0, g1))
+    assert all(math.isclose(q0[k], q1[k], rel_tol=1e-4, abs_tol=1e-6) for k in q0)  # metrics over the whole batch
+    assert 0 < q0["q_std"] < 8 ** -0.5 + 0.1 and 0 < q0["r_std"]
+    assert same_grads(g0, g1)
+
+
+def head_bn_reference(m, x, valid):
+    """Whole batch at once with the BN head on all windows: the gradient _bn_align must reproduce."""
+    rec = pt.rec_loss(m, x, valid, SPIKE)
+    v1, v2 = pt.sample_views(valid)
+    q1, p1 = m.align(pt.view_repr(m, x, v1, SPIKE))
+    q2, p2 = m.align(pt.view_repr(m, x, v2, SPIKE))
+    align = pt.simsiam_loss(p1, q2, p2, q1)
+    (rec + align).backward()
+    return rec.item(), align.item()
+
+
+@pytest.mark.parametrize("group", [None, 4])
+def test_head_bn_packed_gradient_equals_whole_batch(monkeypatch, group):
+    """Collapse ablation RB: with BatchNorm in the head, the two-pass L_align over micro-batches gives the gradient of
+    the whole batch at once (BN over all windows, or per group of windows in batch order as per GPU), with
+    deterministic masks and views and no dropout."""
+    monkeypatch.setattr(pt, "sample_mask", mask_fn)
+    monkeypatch.setattr(pt, "sample_views", views_fn)
+    x, valid = ragged_batch()
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, p=0.0, head_bn=True, head_bn_group=group).train()
+    (r0, a0), g0 = grads_of(m, lambda: head_bn_reference(m, x, valid))
+    (r1, a1, _), g1 = grads_of(m, lambda: batch_losses(m, x, valid, SPIKE, budget=45))
+    # summed micro-batch by micro-batch, so float32 rounding differs (BN over 4 windows magnifies it to about 1e-4)
+    assert math.isclose(r0, r1, rel_tol=1e-5) and math.isclose(a0, a1, rel_tol=1e-5) and close_grads(g0, g1)
+
+
+def test_head_bn_replays_dropout():
+    """The second pass of _bn_align replays the RNG state of the first, so with dropout on and one micro-batch it
+    matches the whole-batch computation drawn in the same order (rec mask, views, view 1, view 2)."""
+    x, valid = ragged_batch()
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, p=0.2, head_bn=True).train()
+
+    def ref():
+        torch.manual_seed(3)
+        return head_bn_reference(m, x, valid)
+
+    def ours():
+        torch.manual_seed(3)
+        return batch_losses(m, x, valid, SPIKE, budget=None)[:2]
+
+    (r0, a0), g0 = grads_of(m, ref)
+    (r1, a1), g1 = grads_of(m, ours)
+    assert math.isclose(r0, r1, rel_tol=1e-5) and math.isclose(a0, a1, rel_tol=1e-5) and same_grads(g0, g1)
+
+
+def test_model_variants():
+    """Collapse ablation RC/RD: no final LayerNorm, max pooling over valid tokens only (padding never wins)."""
+    x, valid = ragged_batch()
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, p=0.0, final_norm=False, pool="max").eval()
+    assert isinstance(m.backbone.norm, torch.nn.Identity)
+    u = m.encode(x, valid)
+    r = m.pool(u, valid)
+    u2 = u.clone()
+    u2[~valid] = 1e6  # padded tokens
+    assert torch.equal(m.pool(u2, valid), r)
+    assert torch.equal(r[0], u[0, :3].amax((0, 1)))
+    with pytest.raises(ValueError):
+        IBrain(pool="cls")
+
+
+@pytest.mark.parametrize("head_bn", [False, True])
+def test_collapse_metrics_logged_and_snapshots_kept(tmp_path, head_bn):
+    write_synthetic(tmp_path / "data", (3, 8), n_windows=8)
+    dl = DataLoader(SpikeWindows(read_windows(tmp_path / "data", SYNTHETIC)), batch_size=4, shuffle=True,
+                    collate_fn=collate)
+    m = IBrain(d=16, H=2, ffn=32, L=1, d_proj=8, head_bn=head_bn, head_bn_group=2 if head_bn else None)
+    hist = pretrain(m, [(SPIKE, dl)], steps=2, warmup=1, out_dir=tmp_path / "run", keep_every=1)
+    assert all(0 <= h["q_std"] < 1 and 0 <= h["r_std"] < 1 and -2 <= h["d_gap"] <= 2 for h in hist)
+    assert sorted(p.name for p in (tmp_path / "run").glob("ckpt_*.pt")) == ["ckpt_0000001.pt", "ckpt_0000002.pt"]
+
+
+def test_group_batchnorm():
+    """Per-GPU BN: each group of rows is normalized with its own statistics; running statistics come from the first
+    group only (rank 0); eval and a batch of one group behave as BatchNorm1d; a last group of one row joins the previous."""
+    from ibrain.model import GroupBatchNorm1d
+    torch.manual_seed(0)
+    x = torch.randn(9, 3) * torch.tensor([1.0, 5.0, 0.2]) + 3
+    g, ref = GroupBatchNorm1d(3, group=4).train(), torch.nn.BatchNorm1d(3).train()
+    y = g(x)
+    expect = torch.cat([torch.nn.functional.batch_norm(c, None, None, training=True) for c in (x[:4], x[4:])])
+    assert torch.allclose(y, expect, atol=1e-5)  # groups 4 and 4 + 1
+    ref(x[:4])
+    assert torch.allclose(g.running_mean, ref.running_mean) and torch.allclose(g.running_var, ref.running_var)
+    assert torch.allclose(g.eval()(x), ref.eval()(x))
+    assert torch.allclose(GroupBatchNorm1d(3, group=16).train()(x), torch.nn.BatchNorm1d(3).train()(x))
 
 
 def test_grad_checkpoint_same_gradient():

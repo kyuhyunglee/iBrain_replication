@@ -1,5 +1,5 @@
 # Paper settings (SPEC 1.4, 1.6). Change only paths and resources to match the environment.
-model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128}
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128, head_bn: true, head_bn_group: 32}  # U7: SimSiam head with BN per 32 windows
 pretrain:
   steps: null          # if null, epochs × (spike loader batches) × (number of loaders) (U20)
   epochs: 30

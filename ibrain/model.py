@@ -102,12 +102,13 @@ class CrissCrossBlock(nn.Module):
 
 
 class Backbone(nn.Module):
-    """F_ST: L blocks (Eq. 5). Shared by both signal types. The last LayerNorm is ours, not in the paper (U23)."""
+    """F_ST: L blocks (Eq. 5). Shared by both signal types. The last LayerNorm is ours, not in the paper (U23);
+    final_norm=False leaves it out (collapse ablation, 2026-10-08)."""
 
-    def __init__(self, d, H, ffn, S, L, p):
+    def __init__(self, d, H, ffn, S, L, p, final_norm=True):
         super().__init__()
         self.blocks = nn.ModuleList([CrissCrossBlock(d, H, ffn, S, p) for _ in range(L)])
-        self.norm = nn.LayerNorm(d)
+        self.norm = nn.LayerNorm(d) if final_norm else nn.Identity()
 
     def forward(self, z, valid, ckpt=False):
         """ckpt: activation checkpointing per block (U37), recomputes each block in backward instead of storing it."""
@@ -116,19 +117,55 @@ class Backbone(nn.Module):
         return self.norm(z)
 
 
+class GroupBatchNorm1d(nn.BatchNorm1d):
+    """BatchNorm1d whose training statistics come from consecutive groups of `group` rows, as BN on each of several
+    GPUs without SyncBN (the paper's 8 GPUs x 32). Batches are drawn at random, so the groups are random subsets.
+    Running statistics are updated from the first group only, like the rank-0 copy a DDP checkpoint keeps. A last
+    group of one row joins the previous one. group None, or a batch no larger than one group: plain BatchNorm1d."""
+
+    def __init__(self, num_features, group=None, **kw):
+        super().__init__(num_features, **kw)
+        self.group = group
+
+    def forward(self, x):
+        if not self.training or self.group is None or len(x) <= self.group:
+            return super().forward(x)
+        chunks = list(x.split(self.group))
+        if len(chunks[-1]) < 2:
+            chunks[-2:] = [torch.cat(chunks[-2:])]
+        out = [super().forward(chunks[0])]  # also updates the running statistics
+        out += [F.batch_norm(c, None, None, self.weight, self.bias, True, 0.0, self.eps) for c in chunks[1:]]
+        return torch.cat(out)
+
+
 class IBrain(nn.Module):
-    def __init__(self, d=256, H=8, ffn=1024, L=6, S=10, P_spike=5, P_ieeg=50, p=0.1, d_proj=128):
+    def __init__(self, d=256, H=8, ffn=1024, L=6, S=10, P_spike=5, P_ieeg=50, p=0.1, d_proj=128, final_norm=True,
+                 pool="mean", head_bn=False, head_bn_group=None):
+        """final_norm, pool: variants from the collapse ablation (2026-10-08); the decided model keeps the defaults,
+        final LayerNorm (U23) and mean pooling over valid tokens (U6). head_bn: BatchNorm in the SimSiam head, decided
+        on (U7) and set in configs/paper.yaml; the default False keeps checkpoints from before 2026-10-08 loadable.
+        head_bn_group: BN statistics per group of that many windows of a step (per GPU, U7: 32), None = whole step."""
         super().__init__()
+        if pool not in ("mean", "max"):
+            raise ValueError(f"pool must be 'mean' or 'max', got {pool!r}")
+        self.d, self.pool_mode, self.head_bn = d, pool, head_bn
         # e_type (Eq. 2): one parameter per signal type, so a step of one type leaves the other's row
         # without a gradient and AdamW skips it (no decay, no momentum) (U24)
         self.type_emb = nn.ParameterList([nn.Parameter(torch.randn(d) * 0.02) for _ in range(2)])  # U22 init
         self.time_emb = nn.Parameter(torch.randn(S, d) * 0.02)  # e_time (Eq. 2)
         self.enc = nn.ModuleList([SpikeEncoder(P_spike, d), IEEGEncoder(P_ieeg, d)])  # index = SPIKE, IEEG
         self.dec = nn.ModuleList([PatchDecoder(d, P_spike), PatchDecoder(d, P_ieeg)])
-        self.backbone = Backbone(d, H, ffn, S, L, p)
+        self.backbone = Backbone(d, H, ffn, S, L, p, final_norm)
         # channel-view alignment head (Eq. 12, U7). projection d -> 128, predictor 128 -> 64 -> 128
-        self.proj = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d_proj))
-        self.pred = nn.Sequential(nn.Linear(d_proj, d_proj // 2), nn.GELU(), nn.Linear(d_proj // 2, d_proj))
+        if head_bn:  # SimSiam's placement: BN after each hidden layer and on the projection output (no affine there)
+            g = head_bn_group
+            self.proj = nn.Sequential(nn.Linear(d, d, bias=False), GroupBatchNorm1d(d, g), nn.GELU(),
+                                      nn.Linear(d, d_proj, bias=False), GroupBatchNorm1d(d_proj, g, affine=False))
+            self.pred = nn.Sequential(nn.Linear(d_proj, d_proj // 2, bias=False), GroupBatchNorm1d(d_proj // 2, g),
+                                      nn.GELU(), nn.Linear(d_proj // 2, d_proj))
+        else:
+            self.proj = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d_proj))
+            self.pred = nn.Sequential(nn.Linear(d_proj, d_proj // 2), nn.GELU(), nn.Linear(d_proj // 2, d_proj))
         # Activation checkpointing of the encoder and each backbone block while training (U37). A runtime switch,
         # not a weight: it changes memory and time only, the outputs and gradients are the same
         self.grad_checkpoint = False
@@ -142,8 +179,9 @@ class IBrain(nn.Module):
     def reconstruct(self, u, sig=SPIKE):  # Eq. 7
         return self.dec[sig](u)
 
-    @staticmethod
-    def pool(u, valid):  # mean over valid tokens (U6). (B, C, S, d), (B, C) -> (B, d)
+    def pool(self, u, valid):  # over valid tokens (U6): mean, or max for the ablation. (B, C, S, d), (B, C) -> (B, d)
+        if self.pool_mode == "max":
+            return u.masked_fill(~valid[:, :, None, None], float("-inf")).amax((1, 2))
         w = valid[..., None, None].to(u.dtype)
         return (u * w).sum((1, 2)) / (w.sum((1, 2)) * u.shape[2])
 

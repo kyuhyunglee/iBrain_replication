@@ -102,7 +102,8 @@ def main():
     model = IBrain(**cfg["model"])
     pretrain(model, loaders, steps, pc["warmup"], a.device, out_dir=out, ckpt_every=pc["ckpt_every"],
              resume=a.resume, meta=meta, accum=accum, precision=precision,
-             token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False))
+             token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False),
+             keep_every=pc.get("keep_every"))
 
 
 if __name__ == "__main__":

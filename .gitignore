@@ -436,6 +436,7 @@ __pycache__/
 runs/
 logs/
 *.pt
+configs/collapse/
 
 # Paper PDF
 *.pdf

@@ -13,7 +13,7 @@ import torch
 import yaml
 
 from ibrain.model import IBrain, IEEG, SPIKE
-from ibrain.pretrain import PRECISION, step_losses
+from ibrain.pretrain import PRECISION, rec_loss, sample_views, step_losses, view_repr
 
 UNITS = {SPIKE: (64, 96, 128, 256, 512, 1024, 1734), IEEG: (32, 64, 128, 256)}
 
@@ -29,8 +29,15 @@ def measure(model, sig, n, C, amp, P):
     model.zero_grad(set_to_none=True)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    rec, align = step_losses(model, x, valid, sig, amp)
-    (rec + align).backward()
+    if model.head_bn:  # a BN head needs the whole step's windows (pretrain._bn_align); per micro-batch it is the
+        # masked pass and the two view passes, the head itself is negligible
+        loss = rec_loss(model, x, valid, sig, amp)
+        for v in sample_views(valid):
+            loss = loss + view_repr(model, x, v, sig, amp).sum()
+        loss.backward()
+    else:
+        rec, align = step_losses(model, x, valid, sig, amp)
+        (rec + align).backward()
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / 2 ** 30, (time.perf_counter() - t0) * 1e3
 

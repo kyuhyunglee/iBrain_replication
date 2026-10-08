@@ -51,23 +51,59 @@ def total_steps(epochs, n_spike_batches, n_loaders, accum=1):
     return -(-epochs * n_spike_batches // accum) * n_loaders
 
 
-def step_losses(model, x, valid, sig, amp=None):
+def _autocast(device, amp):
+    return torch.autocast(torch.device(device).type, dtype=amp or torch.bfloat16, enabled=amp is not None)
+
+
+def rec_loss(model, x, valid, sig, amp=None):
+    """L_rec (Eq. 9 or 11) with a fresh 50% mask (Eq. 6: mask in raw signal space, then encode)."""
+    mask = sample_mask(valid, x.shape[2])
+    with _autocast(x.device, amp):
+        u = model.encode(x.masked_fill(mask[..., None], 0.0), valid, sig)
+        xhat = model.reconstruct(u, sig).float()
+    return masked_poisson_nll(xhat, x, mask, valid) if sig == SPIKE else masked_mse(xhat, x, mask, valid)
+
+
+def view_repr(model, x, view, sig, amp=None):
+    """Pooled representation r of one channel view (the view mask in place of V_c, U17), float32 (B, d)."""
+    with _autocast(x.device, amp):
+        return model.pool(model.encode(x, view, sig), view).float()
+
+
+def step_losses(model, x, valid, sig, amp=None, return_parts=False):
     """(L_rec, L_align) for one step (Eq. 13). sig = SPIKE: Eq. 10, 11. sig = IEEG: Eq. 8, 9.
     iEEG x is already channel-normalized by the Dataset (U4), so input and target are the same values.
-    amp: autocast dtype for the model forward (U36), None = float32. The losses are always computed in float32."""
-    def fwd():
-        return torch.autocast(x.device.type, dtype=amp or torch.bfloat16, enabled=amp is not None)
+    amp: autocast dtype for the model forward (U36), None = float32. The losses are always computed in float32.
+    return_parts: also return {r1, q1, p1, q2} (detached, CPU) for the collapse metrics."""
+    rec = rec_loss(model, x, valid, sig, amp)
+    v1, v2 = sample_views(valid)  # views use the unmasked x (U17)
+    r1 = view_repr(model, x, v1, sig, amp)
+    with _autocast(x.device, amp):
+        q1, p1 = model.align(r1)
+        q2, p2 = model.align(view_repr(model, x, v2, sig, amp))
+    align = simsiam_loss(p1.float(), q2.float(), p2.float(), q1.float())  # Eq. 12
+    if not return_parts:
+        return rec, align
+    return rec, align, {k: v.detach().float().cpu() for k, v in (("r1", r1), ("q1", q1), ("p1", p1), ("q2", q2))}
 
-    mask = sample_mask(valid, x.shape[2])
-    with fwd():
-        u = model.encode(x.masked_fill(mask[..., None], 0.0), valid, sig)  # Eq. 6: mask in raw signal space, then encode
-        xhat = model.reconstruct(u, sig).float()
-    rec = masked_poisson_nll(xhat, x, mask, valid) if sig == SPIKE else masked_mse(xhat, x, mask, valid)
-    v1, v2 = sample_views(valid)  # views use the unmasked x, with the view mask in place of V_c (U17)
-    with fwd():
-        q1, p1 = model.align(model.pool(model.encode(x, v1, sig), v1))
-        q2, p2 = model.align(model.pool(model.encode(x, v2, sig), v2))
-    return rec, simsiam_loss(p1.float(), q2.float(), p2.float(), q1.float())  # Eq. 12
+
+def q_std(q):
+    """SimSiam's collapse metric: per-dimension std over windows of the l2-normalized projection, averaged over
+    dimensions. About 1/sqrt(d_proj) when the outputs are spread out, 0 when every window gives the same q."""
+    return torch.nn.functional.normalize(q.float(), dim=-1).std(0).mean().item()
+
+
+def collapse_metrics(parts):
+    """Per-step collapse metrics from one batch's {r1, q1, p1, q2}:
+    q_std  q_std of the projection (fixed near 1/sqrt(d_proj) by construction when the head ends in BatchNorm)
+    r_std  the same metric on the pooled backbone representation r, which no head normalization touches
+    d_gap  D(p1, q2 of another window) - D(p1, q2 of the same window), D = -cos. About 0 when the head cannot tell
+           windows apart (collapse), larger when it can."""
+    cos = torch.nn.functional.cosine_similarity
+    p1, q2 = parts["p1"], parts["q2"]
+    other = torch.roll(torch.arange(len(p1)), 1)
+    d_gap = cos(p1, q2, dim=-1).mean() - cos(p1, q2[other], dim=-1).mean()
+    return {"q_std": q_std(parts["q1"]), "r_std": q_std(parts["r1"]), "d_gap": d_gap.item()}
 
 
 def pack(n_units, budget=None):
@@ -95,24 +131,88 @@ def batch_losses(model, x, valid, sig, amp=None, budget=None, scale=1.0):
     Each micro-batch is cut to its own largest window, so little compute goes to padding. The micro-batch losses are
     weighted so that the gradient equals that of the whole batch at once: L_rec is a mean over masked tokens (each
     window masks exactly n_units * S // 2, U15), so a micro-batch weighs by its share of masked tokens; L_align is a
-    mean over windows, so it weighs by its share of windows. Returns the whole-batch (L_rec, L_align) as floats."""
+    mean over windows, so it weighs by its share of windows. A model with BatchNorm in the SimSiam head (head_bn)
+    takes `_bn_align` for L_align, so the head sees the whole batch. Returns the whole-batch L_rec and L_align as
+    floats and the batch's `collapse_metrics`."""
     n = valid.sum(1).cpu()
     masked = (n * x.shape[2] // 2).sum().clamp(min=1)
     device = next(model.parameters()).device
     rec_b = align_b = 0.0
+    parts = []
     for idx in pack(n, budget):
         c = int(n[idx].max())
         xc, vc = x[idx, :c].to(device), valid[idx, :c].to(device)
         w_rec = float((n[idx] * x.shape[2] // 2).sum() / masked)
-        w_align = len(idx) / len(n)
-        rec, align = step_losses(model, xc, vc, sig, amp)
-        ((w_rec * rec + w_align * align) * scale).backward()
-        rec_b, align_b = rec_b + w_rec * rec.item(), align_b + w_align * align.item()
-    return rec_b, align_b
+        if model.head_bn:
+            rec = rec_loss(model, xc, vc, sig, amp)
+            (w_rec * rec * scale).backward()
+        else:
+            w_align = len(idx) / len(n)
+            rec, align, part = step_losses(model, xc, vc, sig, amp, return_parts=True)
+            ((w_rec * rec + w_align * align) * scale).backward()
+            align_b += w_align * align.item()
+            parts.append((idx, part))
+        rec_b += w_rec * rec.item()
+    if model.head_bn:
+        align_b, whole = _bn_align(model, x, valid, n, sig, amp, budget, scale, device)
+    else:  # back to batch order
+        whole = {k: torch.zeros(len(n), v.shape[1]) for k, v in parts[0][1].items()}
+        for idx, part in parts:
+            for k, v in part.items():
+                whole[k][idx] = v
+    return rec_b, align_b, collapse_metrics(whole)
+
+
+def _rng_state(device):
+    return torch.get_rng_state(), (torch.cuda.get_rng_state(device) if device.type == "cuda" else None)
+
+
+def _set_rng_state(state, device):
+    torch.set_rng_state(state[0])
+    if state[1] is not None:
+        torch.cuda.set_rng_state(state[1], device)
+
+
+def _bn_align(model, x, valid, n, sig, amp, budget, scale, device):
+    """L_align when the SimSiam head has BatchNorm (collapse ablation RB, 2026-10-08). BN needs the whole batch (a
+    micro-batch can be one window), so the gradient is taken in two passes (as in GradCache): (1) the pooled view
+    representations r of all windows without a graph, micro-batch by micro-batch; the head and L_align on all of them
+    at once, backward to the head and to r; (2) each micro-batch again with a graph, with the RNG state of pass 1 so
+    dropout matches, and its share of dL/dr. The gradient equals that of the whole batch at once. r stays in batch
+    order, so a head with head_bn_group sees random groups, as one GPU each. Returns (L_align, {r1, q1, p1, q2})."""
+    views = sample_views(valid)  # for the whole batch, as step_losses draws them per batch
+    chunks = []
+    for idx in pack(n, budget):
+        c = int(n[idx].max())
+        chunks.append((idx, c, [None, None]))  # RNG state before each view's pass 1, replayed in pass 2
+    r = [torch.zeros(len(n), model.d, device=device) for _ in views]
+    with torch.no_grad():
+        for idx, c, states in chunks:
+            xc = x[idx, :c].to(device)
+            for k, v in enumerate(views):
+                states[k] = _rng_state(device)
+                r[k][idx] = view_repr(model, xc, v[idx, :c].to(device), sig, amp)
+    after = _rng_state(device)
+    r = [rk.requires_grad_() for rk in r]
+    with _autocast(device, amp):
+        q1, p1 = model.align(r[0])
+        q2, p2 = model.align(r[1])
+    align = simsiam_loss(p1.float(), q2.float(), p2.float(), q1.float())
+    (align * scale).backward()
+    grads = [rk.grad for rk in r]
+    for idx, c, states in chunks:
+        xc = x[idx, :c].to(device)
+        total = 0.0
+        for k, v in enumerate(views):
+            _set_rng_state(states[k], device)
+            total = total + (view_repr(model, xc, v[idx, :c].to(device), sig, amp) * grads[k][idx]).sum()
+        total.backward()
+    _set_rng_state(after, device)
+    return align.item(), {k: v.detach().float().cpu() for k, v in (("r1", r[0]), ("q1", q1), ("p1", p1), ("q2", q2))}
 
 
 def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckpt_every=1000, resume=None, meta=None,
-             accum=1, precision="fp32", token_budget=None, grad_checkpoint=False):
+             accum=1, precision="fp32", token_budget=None, grad_checkpoint=False, keep_every=None):
     """loaders = [(sig, DataLoader), ...], batches are collate's (x, valid).
     step t uses `accum` batches from loaders[t % len(loaders)] (the 1:1 alternation of Eq. 13): their losses are
     averaged before one optimizer step, which gives the gradient of one batch accum times larger (U33; the paper's
@@ -122,7 +222,8 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
     If out_dir is set: one line per step in log.jsonl, ckpt.pt (latest) every ckpt_every steps, final.pt at the end.
     resume is a ckpt path: restores model, optimizer, step, records and RNG state. Loader order is reshuffled (U26).
     precision: "fp32" or "bf16" (autocast of the model forward, weights and optimizer stay float32, U36).
-    grad_checkpoint: activation checkpointing of the encoder and backbone blocks (U37)."""
+    grad_checkpoint: activation checkpointing of the encoder and backbone blocks (U37).
+    keep_every: also keep a checkpoint every that many steps as ckpt_<steps done>.pt (not overwritten)."""
     if precision not in PRECISION:
         raise ValueError(f"precision must be one of {sorted(PRECISION)}, got {precision!r}")
     amp = PRECISION[precision]
@@ -149,16 +250,18 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
             g["lr"] = lr
         opt.zero_grad()  # set_to_none: the inactive type's encoder/decoder/type_emb keep grad None, AdamW skips them (U24)
         rec_sum = align_sum = 0.0
+        mets = {}
         for _ in range(accum):
             batch = next(its[i], None)
             if batch is None:  # end of a pass, reshuffle and cycle (U20)
                 its[i] = iter(dl)
                 batch = next(its[i])
-            rec, align = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / accum)
+            rec, align, m = batch_losses(model, batch[0], batch[1], sig, amp, token_budget, 1 / accum)
             rec_sum, align_sum = rec_sum + rec, align_sum + align
+            mets = {k: mets.get(k, 0.0) + v / accum for k, v in m.items()}
         torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP)
         opt.step()
-        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum})
+        hist.append({"step": t, "sig": sig, "lr": lr, "rec": rec_sum / accum, "align": align_sum / accum, **mets})
         if log:
             log.write(json.dumps(hist[-1]) + "\n")
             log.flush()
@@ -167,6 +270,8 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
             print(f"{hist[-1]}{gpu}")
         if out_dir and ((t + 1) % ckpt_every == 0 or t == steps - 1):
             save_checkpoint(Path(out_dir) / "ckpt.pt", model, opt, t, hist, meta)
+        if out_dir and keep_every and (t + 1) % keep_every == 0:
+            save_checkpoint(Path(out_dir) / f"ckpt_{t + 1:07d}.pt", model, opt, t, hist, meta)
     if out_dir:
         save_checkpoint(Path(out_dir) / "final.pt", model, opt, steps - 1, hist, meta)
         log.close()

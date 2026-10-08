@@ -2,7 +2,8 @@
 # Checks that the readers, 256 windows per step cut into token_budget micro-batches in bf16 (U33, U36), checkpoints and
 # the 1:1 alternation work before paper.yaml. pretrain.sbatch first checks the budget's largest micro-batches on the GPU.
 #   sbatch --time=02:00:00 --job-name=ibrain-smoke scripts/slurm/pretrain.sbatch configs/smoke.yaml 0 runs/smoke_s0
-model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128}
+# Before 2026-10-08 the head had no BN (U7); that run, runs/smoke_s0, is the collapse ablation baseline R0.
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128, head_bn: true, head_bn_group: 32}  # U7: SimSiam head with BN per 32 windows
 pretrain:
   steps: 200           # 100 spike + 100 iEEG optimizer steps
   epochs: null
