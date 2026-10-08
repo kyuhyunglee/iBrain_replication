@@ -22,17 +22,24 @@ import torch.nn.functional as F
 import yaml
 
 from ibrain.data_ieeg import IEEGStream, ajile12_blocks, select_hours, swec_blocks
-from ibrain.data_pile import pile_files, row_matrices
+from ibrain.data_pile import PileMemmap, pile_files, row_matrices
 from ibrain.data_spike import WINDOW_BINS, collate, to_patches
 from ibrain.model import IBrain, IEEG, SPIKE
 from ibrain.pretrain import pack, sample_views
 from ibrain.repro import load_checkpoint
 
 
-def spike_windows(root, n, files, seed):
-    """n random 1 s windows from `files` Neural Pile parquet files spread over the split (several sources)."""
+def spike_windows(sc, n, files, seed):
+    """n random 1 s windows of the Neural Pile, read as data.spike `sc` says: with format pile_mmap from the whole
+    converted copy (U30); with format pile from `files` parquet files spread over the split (several sources)."""
     rng = np.random.default_rng(seed)
-    paths = pile_files(root)
+    if sc["format"] == "pile_mmap":
+        ds = PileMemmap(sc["root"], sc.get("split", "train"))
+        pick = np.sort(rng.choice(len(ds), n, replace=False))
+        rows = np.searchsorted(ds.end, pick, side="right")
+        print(f"spike: {n} windows from the whole pile, sources {sorted(set(ds.source[rows].tolist()))}")
+        return [ds[int(i)] for i in pick]
+    paths = pile_files(sc["root"])
     paths = [paths[i] for i in np.linspace(0, len(paths) - 1, files).round().astype(int)]
     mats, srcs = [], []
     for p in paths:
@@ -70,7 +77,7 @@ def embed(model, windows, sig, budget, device, views=None):
         valid = views
     # width each window needs: its last valid channel + 1 (a view is not a prefix of the channels)
     width = (valid * torch.arange(1, valid.shape[1] + 1)).amax(1)
-    r = torch.zeros(len(windows), model.backbone.norm.normalized_shape[0])
+    r = torch.zeros(len(windows), model.d)
     for idx in pack(width, budget):
         c = int(width[idx].max())
         xc, vc = x[idx, :c].to(device), valid[idx, :c].to(device)
@@ -105,8 +112,9 @@ def metrics(model, windows, sig, budget, device, seed):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True)
-    ap.add_argument("--config", default=None, help="default: the config stored in the checkpoint")
+    ap.add_argument("--ckpt", required=True, nargs="+", help="one or more checkpoints of the same config "
+                                                              "(e.g. a run's kept snapshots); the data is read once")
+    ap.add_argument("--config", default=None, help="default: the config stored in the first checkpoint")
     ap.add_argument("--n", type=int, default=512)
     ap.add_argument("--pile-files", type=int, default=4)
     ap.add_argument("--ieeg-hours", type=float, default=0.3, help="per iEEG source")
@@ -114,20 +122,23 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ck = load_checkpoint(a.ckpt, "cpu")
-    cfg = yaml.safe_load(Path(a.config).read_text()) if a.config else ck["meta"]["config"]
-    trained = IBrain(**cfg["model"])
-    trained.load_state_dict(ck["model"])
+    cks = [(path, load_checkpoint(path, "cpu")) for path in a.ckpt]
+    cfg = yaml.safe_load(Path(a.config).read_text()) if a.config else cks[0][1]["meta"]["config"]
     torch.manual_seed(a.seed)
-    init = IBrain(**cfg["model"])
-    print(f"checkpoint {a.ckpt} step {ck['step']}; 1/sqrt(d_proj) = {cfg['model']['d_proj'] ** -0.5:.3f}")
-    data = {SPIKE: spike_windows(cfg["data"]["spike"]["root"], a.n, a.pile_files, a.seed),
+    models = [("init", IBrain(**cfg["model"]))]
+    for path, ck in cks:
+        m = IBrain(**ck["meta"]["config"]["model"])
+        m.load_state_dict(ck["model"])
+        models.append((f"step {ck['step'] + 1}", m))
+        print(f"checkpoint {path}: {ck['step'] + 1} steps done")
+    print(f"1/sqrt(d_proj) = {cfg['model']['d_proj'] ** -0.5:.3f}")
+    data = {SPIKE: spike_windows(cfg["data"]["spike"], a.n, a.pile_files, a.seed),
             IEEG: ieeg_windows(cfg, a.n, a.ieeg_hours, a.seed)}
     for sig, name in ((SPIKE, "spike"), (IEEG, "iEEG")):
-        for label, m in (("init", init), ("trained", trained)):
+        for label, m in models:
             m.to(device).eval()
             res = metrics(m, data[sig], sig, a.budget, device, a.seed)
-            print(f"{name:5s} {label:7s} " + " ".join(f"{k}={v:7.3f}" for k, v in res.items()))
+            print(f"{name:5s} {label:10s} " + " ".join(f"{k}={v:7.3f}" for k, v in res.items()))
 
 
 if __name__ == "__main__":
