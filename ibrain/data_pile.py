@@ -188,6 +188,7 @@ class PileMemmap(_Windows):
         kept, sources = select_rows(idx["source"].tolist(), split, exclude_sources, max_rows, seed)
         self.shard, self.offset = idx["shard"][kept], idx["offset"][kept]
         self.n_units, n_bins = idx["n_units"][kept], idx["n_bins"][kept]
+        self.source = idx["source"][kept]  # source_dataset per kept row
         self._mm = {}
         self._finish(split, meta["rows"], np.where(self.n_units > 0, n_bins // WINDOW_BINS, 0), sources,
                      exclude_sources)
