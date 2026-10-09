@@ -212,7 +212,7 @@ def _bn_align(model, x, valid, n, sig, amp, budget, scale, device):
 
 
 def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckpt_every=1000, resume=None, meta=None,
-             accum=1, precision="fp32", token_budget=None, grad_checkpoint=False, keep_every=None):
+             accum=1, precision="fp32", token_budget=None, grad_checkpoint=False, keep_every=None, use_compile=False):
     """loaders = [(sig, DataLoader), ...], batches are collate's (x, valid).
     step t uses `accum` batches from loaders[t % len(loaders)] (the 1:1 alternation of Eq. 13): their losses are
     averaged before one optimizer step, which gives the gradient of one batch accum times larger (U33; the paper's
@@ -223,12 +223,15 @@ def pretrain(model, loaders, steps, warmup=2000, device="cpu", out_dir=None, ckp
     resume is a ckpt path: restores model, optimizer, step, records and RNG state. Loader order is reshuffled (U26).
     precision: "fp32" or "bf16" (autocast of the model forward, weights and optimizer stay float32, U36).
     grad_checkpoint: activation checkpointing of the encoder and backbone blocks (U37).
-    keep_every: also keep a checkpoint every that many steps as ckpt_<steps done>.pt (not overwritten)."""
+    keep_every: also keep a checkpoint every that many steps as ckpt_<steps done>.pt (not overwritten).
+    use_compile: torch.compile the encoders, decoders and backbone blocks (IBrain.compile_parts, U40)."""
     if precision not in PRECISION:
         raise ValueError(f"precision must be one of {sorted(PRECISION)}, got {precision!r}")
     amp = PRECISION[precision]
     model.to(device).train()
     model.grad_checkpoint = grad_checkpoint
+    if use_compile:
+        model.compile_parts()
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WD)  # U19
     start, hist = 0, []
     if resume:

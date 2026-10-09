@@ -360,3 +360,25 @@ def test_grad_checkpoint_same_gradient():
     l1, g1 = run(True)
     assert math.isclose(l0, l1, rel_tol=1e-6)
     assert all(torch.allclose(u, v, atol=1e-6, rtol=1e-5) for u, v in zip(g0, g1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="compile is used on GPU (Triton); the CPU nodes' g++ "
+                    "has no -std=c++20 for inductor's CPU backend")
+def test_compile_same_as_eager():
+    """U40: compile_parts changes speed only. Same weights and seed, float32, dropout on, a ragged batch cut into
+    several micro-batches (so compiled code sees several shapes) and a BN head per group (so the dropout replay of
+    the two-pass L_align runs through compiled blocks): same losses and gradients as eager. Runs on GPU."""
+    import copy
+    x, valid = (t.cuda() for t in ragged_batch())
+    eager = IBrain(d=16, H=2, ffn=32, L=2, d_proj=8, p=0.1, head_bn=True, head_bn_group=4).cuda().train()
+    comp = copy.deepcopy(eager).compile_parts()
+
+    def run(m):
+        torch.manual_seed(7)
+        return batch_losses(m, x, valid, SPIKE, budget=45)[:2]
+
+    (r0, a0), g0 = grads_of(eager, lambda: run(eager))
+    (r1, a1), g1 = grads_of(comp, lambda: run(comp))
+    assert len(pack(valid.sum(1), 45)) > 2
+    assert math.isclose(r0, r1, rel_tol=1e-4) and math.isclose(a0, a1, rel_tol=1e-4) and close_grads(g0, g1)
+    assert dict(eager.named_parameters()).keys() == dict(comp.named_parameters()).keys()  # checkpoints unchanged

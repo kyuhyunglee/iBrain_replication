@@ -170,6 +170,20 @@ class IBrain(nn.Module):
         # not a weight: it changes memory and time only, the outputs and gradients are the same
         self.grad_checkpoint = False
 
+    def compile_parts(self):
+        """torch.compile the encoders, decoders and backbone blocks in place (pretrain.compile, U40): the many small
+        ops of a block (LayerNorm, residual, dropout, reshapes, dtype casts) are fused into few kernels. In place, so
+        parameter names and checkpoints do not change. dynamic=True, because micro-batches differ in windows and
+        units. Dropout draws from the eager RNG (fallback_random), so the second pass of _bn_align replays it."""
+        import torch._dynamo
+        import torch._inductor.config
+
+        torch._inductor.config.fallback_random = True
+        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
+        for m in (*self.enc, *self.dec, *self.backbone.blocks):
+            m.compile(dynamic=True)
+        return self
+
     def encode(self, x, valid, sig=SPIKE):  # (B, C, S, P_sig), (B, C) -> U (B, C, S, d)
         ckpt = self.grad_checkpoint and self.training and torch.is_grad_enabled()
         h = checkpoint(self.enc[sig], x, use_reentrant=False) if ckpt else self.enc[sig](x)  # Eq. 1

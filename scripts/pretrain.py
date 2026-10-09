@@ -91,7 +91,8 @@ def main():
     precision = pc.get("precision", "fp32")  # U36
     meta["data"] = {"spike_windows": len(ds_spike), "spike_hours": spike_h, "ieeg_hours": ieeg_h, "steps": steps,
                     "grad_accum": accum, "windows_per_step": pc["batch_size"] * accum, "precision": precision,
-                    "token_budget": pc.get("token_budget"), "grad_checkpoint": pc.get("grad_checkpoint", False)}
+                    "token_budget": pc.get("token_budget"), "grad_checkpoint": pc.get("grad_checkpoint", False),
+                    "compile": pc.get("compile", False)}
     write_json(out / "meta.json", meta)
     print(f"steps={steps} spike batches/epoch={len(dl_spike)} grad_accum={accum} loaders={len(loaders)} device={a.device} "
           f"precision={precision}")
@@ -103,7 +104,7 @@ def main():
     pretrain(model, loaders, steps, pc["warmup"], a.device, out_dir=out, ckpt_every=pc["ckpt_every"],
              resume=a.resume, meta=meta, accum=accum, precision=precision,
              token_budget=pc.get("token_budget"), grad_checkpoint=pc.get("grad_checkpoint", False),
-             keep_every=pc.get("keep_every"))
+             keep_every=pc.get("keep_every"), use_compile=pc.get("compile", False))
 
 
 if __name__ == "__main__":
