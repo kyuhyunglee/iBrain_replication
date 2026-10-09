@@ -9,6 +9,7 @@ pretrain:
   token_budget: 2048   # micro-batch size in channel slots (windows x their max units), cut by unit count (U33)
   precision: bf16      # autocast of the model forward; weights, optimizer and losses stay fp32 (U36)
   grad_checkpoint: false  # activation checkpointing (U37); true if the token_budget check fails
+  compile: true        # U40: torch.compile of encoders, decoders and backbone blocks (GPU)
   ckpt_every: 1000
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)

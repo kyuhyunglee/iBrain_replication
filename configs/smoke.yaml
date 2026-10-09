@@ -13,6 +13,7 @@ pretrain:
   token_budget: 2048
   precision: bf16
   grad_checkpoint: false
+  compile: true        # U40: torch.compile of encoders, decoders and backbone blocks
   ckpt_every: 50
   num_workers: 4
   shuffle_buffer: 1024
