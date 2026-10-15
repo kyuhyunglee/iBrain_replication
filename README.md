@@ -34,7 +34,7 @@ Checkout `configs/tiny.yaml` for all configurations available.
 
 ### Pretraining on spikes
 To pretrain on real spikes you first need the [Neural Pile primate](https://huggingface.co/datasets/eminorhan/neural-pile-primate) parquet files, the corpus the paper used.
-Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. As in the paper the whole pile is used, although it contains the Perich and Area2-Bump evaluation sessions; set `data.spike.exclude_sources: [perich, area2-bump]` for the variant without them. Each step uses 256 random windows per type, the paper's 8 GPUs x 32. Sessions differ in unit count (96 at the median, up to 1,734), so the 256 are computed in micro-batches of similar unit count with at most `token_budget` channel slots each; the gradient is the same as for the 256 at once (SPEC U33). Training runs in bf16 autocast (`precision`, U36), and `grad_checkpoint: true` trades about one extra forward for memory (U37).
+Set `data.spike.root` in `configs/paper.yaml` to the folder that holds them. As in the paper the whole pile is used, although it contains the Perich and Area2-Bump evaluation sessions; set `data.spike.exclude_sources: [perich, area2-bump]` for the variant without them. Each step uses 256 random windows per type, the paper's 8 GPUs x 32. Sessions differ in unit count (96 at the median, up to 1,734), so the 256 are computed in micro-batches of similar unit count with at most `token_budget` channel slots each; the gradient is the same as for the 256 at once (SPEC U33). Training runs in bf16 autocast (`precision`, U36), and `grad_checkpoint: true` trades about one extra forward for memory (U37). The SimSiam head has BatchNorm with statistics per 32 windows, as on each of the paper's 8 GPUs (`model.head_bn`, `head_bn_group`): without it the representations collapsed on real data (SPEC U7). Every step logs `r_std` and `d_gap` so a collapse shows in `log.jsonl`, and `scripts/check_collapse.py` measures it on checkpoints (U38).
 
 Then you can pretrain on spikes only by running:
 
@@ -54,7 +54,13 @@ Before loading data, the SLURM script checks that the largest micro-batches of `
 sbatch --time=02:00:00 --job-name=ibrain-smoke scripts/slurm/pretrain.sbatch configs/smoke.yaml 0 runs/smoke_s0
 ```
 
-The pile is held in memory, so set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
+Reading the parquet files takes about 30 minutes per run, so training reads a memory-mapped copy instead (`data.spike.format: pile_mmap`, SPEC U30). Make it once with a CPU job (about 40 GB on disk), then point `data.spike.root` at it:
+
+```bash
+sbatch scripts/slurm/pile_to_memmap.sbatch
+```
+
+It gives the same windows as reading the parquet files (`format: pile`), which still works. Set `data.spike.max_rows` for a small first run. We run seeds 0, 1 and 2 for every configuration. To continue an interrupted run, add `--resume runs/spike_s0/ckpt.pt`. The SLURM script does this by itself when a checkpoint exists.
 Checkout `configs/paper.yaml` for all configurations available.
 
 ### Downstream evaluation
@@ -84,6 +90,19 @@ Then you can run the paper's joint pretraining, alternating spike and iEEG batch
 
 ```bash
 sbatch scripts/slurm/pretrain.sbatch configs/paper.yaml 0 runs/joint_s0
+```
+
+For iEEG pilots, `--ieeg-only` is the counterpart of `--spike-only`: every step is an iEEG step and no spike data is read. The iEEG stream has no length, so set `pretrain.steps` in the config:
+
+```bash
+sbatch scripts/slurm/pretrain.sbatch <config> 0 runs/ieeg_s0 --ieeg-only
+```
+
+On several GPUs (whole Perlmutter nodes, 4 A100 each), `scripts/slurm/pretrain_ddp.sbatch` takes the same arguments and starts one rank per GPU with srun; each rank computes its share of a step's 256 windows and the gradients are summed once per step (SPEC U43):
+
+```bash
+sbatch scripts/slurm/pretrain_ddp.sbatch configs/paper.yaml 0 runs/joint_s0        # 4 GPUs
+sbatch -N 2 scripts/slurm/pretrain_ddp.sbatch configs/paper.yaml 0 runs/joint_s0   # 8 GPUs, as the paper
 ```
 
 ### Brain Treebank

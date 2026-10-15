@@ -1,5 +1,5 @@
 # Paper settings (SPEC 1.4, 1.6). Change only paths and resources to match the environment.
-model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128}
+model: {d: 256, H: 8, ffn: 1024, L: 6, S: 10, P_spike: 5, P_ieeg: 50, p: 0.1, d_proj: 128, head_bn: true, head_bn_group: 32}  # U7: SimSiam head with BN per 32 windows
 pretrain:
   steps: null          # if null, epochs × (spike loader batches) × (number of loaders) (U20)
   epochs: 30
@@ -9,20 +9,27 @@ pretrain:
   token_budget: 2048   # micro-batch size in channel slots (windows x their max units), cut by unit count (U33)
   precision: bf16      # autocast of the model forward; weights, optimizer and losses stay fp32 (U36)
   grad_checkpoint: false  # activation checkpointing (U37); true if the token_budget check fails
+  compile: true        # U40: torch.compile of encoders, decoders and backbone blocks (GPU)
   ckpt_every: 1000
+  keep_every: 47420    # one snapshot per epoch (spike + iEEG batches per epoch with 4 ranks: 2 x 23,710)
   num_workers: 4
   shuffle_buffer: 1024   # iEEG windows held per worker for shuffling (about 0.25 GB at 124 channels)
+  open_blocks: 8         # iEEG blocks each DataLoader worker mixes at once; a batch comes from one worker (U41)
 data:
-  # Prefix confirmed on the server 2026-09-29 (iBrain_pretrain/). Folders below it are from the 09-28 survey.
+  # NERSC prefix /pscratch/sd/z/zres0710/iBrain/{pretrain,downstream,cache} (moved from the lab server 2026-10-11).
+  # Folders below it are from the 09-28 survey.
   spike:
-    format: pile         # pile = Neural Pile primate parquet (U10, U30) | corpus = nhp-spike-corpus shards | synthetic
-    root: /storage/connectome/zres0710/iBrain_pretrain/spikes/neural-pile-primate
+    # pile_mmap = memory-mapped copy of the Neural Pile primate parquet files (U10, U30), made once by
+    # scripts/slurm/pile_to_memmap.sbatch | pile = the parquet files (root: .../iBrain/pretrain/spikes/neural-pile-primate,
+    # about 30 min to load) | corpus = nhp-spike-corpus shards | synthetic
+    format: pile_mmap
+    root: /pscratch/sd/z/zres0710/iBrain/cache/neural-pile-primate-mmap
     split: train
     exclude_sources: []   # as in the paper (U14). [perich, area2-bump] = variant without evaluation sessions
-    max_rows: null       # seeded random subset of rows for small runs. null = all rows, held in memory as uint8 (tens of GB)
+    max_rows: null       # seeded random subset of rows for small runs. null = all rows
   ieeg:                  # AJILE12 + SWEC, streamed by block (U31, U32). Skipped with --spike-only (M3)
-    - {format: ajile12, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/AJILE12/000055, max_hours: null}
-    - {format: swec, root: /storage/connectome/zres0710/iBrain_pretrain/iEEG/SWEC/data, max_hours: null}
+    - {format: ajile12, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/AJILE12/000055, max_hours: null}
+    - {format: swec, root: /pscratch/sd/z/zres0710/iBrain/pretrain/iEEG/SWEC/data, max_hours: null}
 finetune:
   head: attn           # attn | mean | flatten (U8)
   epochs: 50
@@ -32,14 +39,17 @@ finetune:
   split_seed: 0        # fixed trial 80/20 split (M4). Independent of the run seed
   seeds: [0, 1, 2]     # U12
   datasets:            # scripts/finetune.py --dataset <name ...> (default: all). Folders checked on the server 2026-10-03
-    mc_maze:    {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/MC_Maze/000128, behavior: hand_vel}
-    area2_bump: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Area2_bump/000127, behavior: hand_vel}
-    perich_tco: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+    mc_maze:    {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/MC_Maze/000128, behavior: hand_vel}
+    area2_bump: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Area2_bump/000127, behavior: hand_vel}
+    perich_tco: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Monkey_long_term/000688,
                  glob: "sub-T/*ses-CO*.nwb", behavior: cursor_vel}   # monkey T, center-out, 6 sessions
-    perich_trt: {format: nwb, root: /storage/connectome/zres0710/iBrain_downstream/spikes/Monkey_long_term/000688,
+    perich_trt: {format: nwb, root: /pscratch/sd/z/zres0710/iBrain/downstream/spikes/Monkey_long_term/000688,
                  glob: "sub-T/*ses-RT*.nwb", behavior: cursor_vel}   # monkey T, random target, 6 sessions
-    treebank:   {format: treebank, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
-                 split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
-    treebank_popt: {format: treebank, variant: true, root: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/data,
-                    split: heldout, cache_dir: /storage/connectome/zres0710/iBrain_downstream/iEEG/BrainTreebank/cache,
+    treebank:   {format: treebank, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                 split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache}  # U34, U35; main: no notch, no re-reference
+    treebank_popt: {format: treebank, variant: true, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                    split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache,
                     reref: laplacian, notch_hz: [60, 120, 180, 240, 300, 360]}  # PopT signal condition (U34), only with --dataset treebank_popt
+    treebank_movie_speech: {format: treebank, variant: true, root: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/data,
+                            split: heldout, cache_dir: /pscratch/sd/z/zres0710/iBrain/downstream/iEEG/BrainTreebank/cache,
+                            tasks: [speech], speech_negatives: movie}  # Speech negatives only while the movie plays (U34)

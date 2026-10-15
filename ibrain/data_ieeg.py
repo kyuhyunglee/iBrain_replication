@@ -265,34 +265,66 @@ def select_hours(blocks, max_hours, seed=0):
 
 class IEEGStream(IterableDataset):
     """1 s windows (C, S, P) streamed from blocks, normalized per block (normalize=False gives raw values, for tests).
-    Each pass visits the blocks in a new random order, and each
-    DataLoader worker takes a disjoint share of that order. Windows go through a shuffle buffer so that a batch mixes
-    several blocks. The order comes from the DataLoader's base seed, so seed_all makes a run reproducible."""
+    Each pass visits the blocks in a new random order, and each DataLoader worker takes a disjoint share of that order.
+    A DataLoader batch comes from one worker, so each worker keeps `open_blocks` blocks open at once and draws each
+    window from one of them at random (U41); a block that runs out is replaced by the worker's next one. The windows
+    then go through a shuffle buffer. With open_blocks=1 a batch held one or two blocks (a block is 675 to 900
+    windows, about the buffer size). Memory per worker: open_blocks normalized blocks (AJILE12 675 s x ~100
+    channels: ~0.14 GB; SWEC 900 s x 128 channels: ~0.23 GB) plus the buffer. The order comes from the DataLoader's
+    base seed, so seed_all makes a run reproducible.
+    shard=(rank, world, seed) splits the blocks over several ranks (U43): every rank draws the same block order from
+    seed and the pass number (set_epoch), and global worker rank * num_workers + id takes every
+    (world * num_workers)-th block of it, so the ranks' shares are disjoint and cover all blocks."""
 
-    def __init__(self, blocks, buffer=1024, normalize=True):
-        self.blocks, self.buffer, self.normalize = list(blocks), buffer, normalize
+    def __init__(self, blocks, buffer=1024, normalize=True, open_blocks=8, shard=None):
+        if open_blocks < 1:
+            raise ValueError(f"open_blocks must be at least 1, got {open_blocks}")
+        self.blocks, self.buffer, self.normalize, self.open_blocks = list(blocks), buffer, normalize, open_blocks
+        self.shard, self.epoch = shard, 0
         self.hours = sum((b.stop - b.start) / b.fs for b in self.blocks) / 3600
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _windows(self, b):
+        """Windows of one block. Reads the block at the first draw, so only open blocks are held in memory."""
+        x = read_block(b)
+        if self.normalize:  # U4 at chunk level: statistics of this block (hundreds of seconds), never of a window
+            x = normalize_block(b, x)
+        if len(x):  # a block without a usable channel gives no window
+            yield from block_windows(b, x)
 
     def __iter__(self):
         info = get_worker_info()
-        base = (info.seed - info.id) if info else int(torch.randint(0, 2 ** 62, (1,)))
-        order = np.random.default_rng(base).permutation(len(self.blocks))
-        if info:
-            order = order[info.id::info.num_workers]
-        rng = np.random.default_rng(base + (info.id if info else 0) + 1)
+        if self.shard is not None:
+            rank, world, seed = self.shard
+            wid, nw = (info.id, info.num_workers) if info else (0, 1)
+            order = np.random.default_rng([seed, self.epoch]).permutation(len(self.blocks))
+            order = order[rank * nw + wid::world * nw]
+            rng = np.random.default_rng([seed, self.epoch, rank, wid, 1])
+        else:
+            base = (info.seed - info.id) if info else int(torch.randint(0, 2 ** 62, (1,)))
+            order = np.random.default_rng(base).permutation(len(self.blocks))
+            if info:
+                order = order[info.id::info.num_workers]
+            rng = np.random.default_rng(base + (info.id if info else 0) + 1)
+        todo = iter(order)
+        active = []
         buf = []
-        for i in order:
-            b = self.blocks[i]
-            x = read_block(b)
-            if self.normalize:  # U4 at chunk level: statistics of this block (hundreds of seconds), never of a window
-                x = normalize_block(b, x)
-            if not len(x):  # no usable channel in this block
+        while True:
+            while len(active) < self.open_blocks and (i := next(todo, None)) is not None:
+                active.append(self._windows(self.blocks[i]))
+            if not active:
+                break
+            k = int(rng.integers(len(active)))
+            w = next(active[k], None)
+            if w is None:  # block exhausted
+                active.pop(k)
                 continue
-            for w in block_windows(b, x):
-                buf.append(w)
-                if len(buf) >= self.buffer:
-                    j = int(rng.integers(len(buf)))
-                    buf[j], buf[-1] = buf[-1], buf[j]
-                    yield buf.pop()
+            buf.append(w)
+            if len(buf) >= self.buffer:
+                j = int(rng.integers(len(buf)))
+                buf[j], buf[-1] = buf[-1], buf[j]
+                yield buf.pop()
         for j in rng.permutation(len(buf)):
             yield buf[j]
